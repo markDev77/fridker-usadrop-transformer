@@ -23,6 +23,7 @@ const BASE_FEE = 200;
 const MARGIN_1 = 1.15;
 const MARGIN_2 = 1.20;
 const FIXED_STOCK = 11;
+const DEFAULT_WEIGHT = 1; // 🔥 NUEVO
 
 /* ==========================
    PostgreSQL
@@ -96,7 +97,6 @@ async function translateText(text) {
 
 async function translateHtmlPreservingTags(html) {
   const $ = cheerio.load(html, { decodeEntities: false });
-
   const textNodes = [];
 
   function walk(node) {
@@ -142,7 +142,6 @@ app.post("/webhook/products-create", async (req, res) => {
 
     console.log("Webhook recibido:", product.title);
 
-    // pequeño delay para evitar conflicto Shopify
     await new Promise(resolve => setTimeout(resolve, 1500));
 
     const freshProduct = await axios.get(
@@ -162,7 +161,7 @@ app.post("/webhook/products-create", async (req, res) => {
 
     const detectedCat = detectCategory(realProduct.title);
 
-    /* ====== 1️⃣ Actualizar producto (sin variants) ====== */
+    /* ====== 1️⃣ Actualizar producto ====== */
 
     await axios.put(
       `https://${shop}/admin/api/2024-01/products/${product.id}.json`,
@@ -184,7 +183,7 @@ app.post("/webhook/products-create", async (req, res) => {
       }
     );
 
-    /* ====== 2️⃣ Actualizar precio variante por variante ====== */
+    /* ====== 2️⃣ Actualizar variantes ====== */
 
     for (const variant of realVariants) {
       await axios.put(
@@ -192,7 +191,16 @@ app.post("/webhook/products-create", async (req, res) => {
         {
           variant: {
             id: variant.id,
-            price: calculatePrice(parseFloat(variant.price))
+
+            // Precio
+            price: calculatePrice(parseFloat(variant.price)),
+
+            // 🔥 SKU EXACTO (respeta PD.xxx)
+            sku: variant.sku,
+
+            // 🔥 Peso fijo 1kg
+            weight: DEFAULT_WEIGHT,
+            weight_unit: "kg"
           }
         },
         {
