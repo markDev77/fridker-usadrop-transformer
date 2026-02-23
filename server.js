@@ -2,13 +2,17 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const { Pool } = require("pg");
+const cheerio = require("cheerio");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-const { DATABASE_URL } = process.env;
+const {
+  DATABASE_URL,
+  OPENAI_API_KEY
+} = process.env;
 
 /* ==========================
    CONFIG NEGOCIO
@@ -51,16 +55,74 @@ function calculatePrice(usd) {
   return Math.ceil(mxn);
 }
 
+function detectCategory(title) {
+  const t = title.toLowerCase();
+
+  if (t.includes("bag") || t.includes("bolsa")) return "BOLSOS";
+  if (t.includes("massage") || t.includes("masaje")) return "TERAPIA";
+  if (t.includes("led")) return "ILUMINACION";
+  if (t.includes("chair")) return "HOGAR";
+
+  return "GENERAL";
+}
+
+async function translateText(text) {
+  if (!text || !text.trim()) return text;
+
+  try {
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "Traduce al español de México." },
+          { role: "user", content: text }
+        ],
+        temperature: 0
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`
+        }
+      }
+    );
+
+    return response.data.choices[0].message.content;
+  } catch (err) {
+    console.log("Traducción omitida:", err.response?.data || err.message);
+    return text;
+  }
+}
+
+async function translateHtmlPreservingTags(html) {
+  const $ = cheerio.load(html, { decodeEntities: false });
+
+  const textNodes = [];
+
+  function walk(node) {
+    if (!node) return;
+    if (node.type === "text") {
+      const raw = node.data;
+      if (raw && raw.trim()) textNodes.push(node);
+    }
+    if (node.children) node.children.forEach(walk);
+  }
+
+  walk($.root()[0]);
+
+  for (const node of textNodes) {
+    node.data = await translateText(node.data);
+  }
+
+  return $.root().html();
+}
+
 async function getToken(shop) {
   const result = await pool.query(
     "SELECT access_token FROM shop_tokens WHERE shop = $1",
     [shop]
   );
-
-  if (!result.rows.length) {
-    throw new Error("Token not found for shop");
-  }
-
+  if (!result.rows.length) throw new Error("Token not found");
   return result.rows[0].access_token;
 }
 
@@ -72,28 +134,49 @@ app.post("/webhook/products-create", async (req, res) => {
   res.status(200).send("ok");
 
   const shop = req.headers["x-shopify-shop-domain"];
-  if (!shop) {
-    console.log("No shop header received");
-    return;
-  }
+  if (!shop) return;
 
   try {
-    console.log("Webhook received from:", shop);
-
     const accessToken = await getToken(shop);
     const product = req.body;
 
-    const updatedVariants = product.variants.map(v => ({
+    console.log("Webhook recibido:", product.title);
+
+    // pequeño delay para evitar conflicto de variantes
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    const freshProduct = await axios.get(
+      `https://${shop}/admin/api/2024-01/products/${product.id}.json`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": accessToken
+        }
+      }
+    );
+
+    const realProduct = freshProduct.data.product;
+    const realVariants = realProduct.variants;
+
+    const translatedTitle = await translateText(realProduct.title);
+    const translatedHtml = await translateHtmlPreservingTags(realProduct.body_html);
+
+    const detectedCat = detectCategory(realProduct.title);
+
+    const updatedVariants = realVariants.map(v => ({
       id: v.id,
       price: calculatePrice(parseFloat(v.price))
     }));
 
-    // 🔥 Actualiza precio y activa producto
     await axios.put(
       `https://${shop}/admin/api/2024-01/products/${product.id}.json`,
       {
         product: {
           id: product.id,
+          title: translatedTitle,
+          body_html: translatedHtml,
+          vendor: "friDker Internacional",
+          product_type: detectedCat,
+          tags: detectedCat,
           variants: updatedVariants,
           status: "active"
         }
@@ -105,20 +188,16 @@ app.post("/webhook/products-create", async (req, res) => {
       }
     );
 
-    // 🔥 Obtener location
     const locations = await axios.get(
       `https://${shop}/admin/api/2024-01/locations.json`,
       {
-        headers: {
-          "X-Shopify-Access-Token": accessToken
-        }
+        headers: { "X-Shopify-Access-Token": accessToken }
       }
     );
 
     const locationId = locations.data.locations[0].id;
 
-    // 🔥 Forzar inventario 11
-    for (const variant of product.variants) {
+    for (const variant of realVariants) {
       await axios.post(
         `https://${shop}/admin/api/2024-01/inventory_levels/set.json`,
         {
@@ -127,14 +206,12 @@ app.post("/webhook/products-create", async (req, res) => {
           available: FIXED_STOCK
         },
         {
-          headers: {
-            "X-Shopify-Access-Token": accessToken
-          }
+          headers: { "X-Shopify-Access-Token": accessToken }
         }
       );
     }
 
-    console.log("Producto actualizado correctamente (sin traducción)");
+    console.log("Producto transformado correctamente");
 
   } catch (err) {
     console.error("Error webhook full:", err.response?.data || err.message);
