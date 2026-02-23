@@ -142,7 +142,7 @@ app.post("/webhook/products-create", async (req, res) => {
 
     console.log("Webhook recibido:", product.title);
 
-    // pequeño delay para evitar conflicto de variantes
+    // pequeño delay para evitar conflicto Shopify
     await new Promise(resolve => setTimeout(resolve, 1500));
 
     const freshProduct = await axios.get(
@@ -162,10 +162,7 @@ app.post("/webhook/products-create", async (req, res) => {
 
     const detectedCat = detectCategory(realProduct.title);
 
-    const updatedVariants = realVariants.map(v => ({
-      id: v.id,
-      price: calculatePrice(parseFloat(v.price))
-    }));
+    /* ====== 1️⃣ Actualizar producto (sin variants) ====== */
 
     await axios.put(
       `https://${shop}/admin/api/2024-01/products/${product.id}.json`,
@@ -177,7 +174,6 @@ app.post("/webhook/products-create", async (req, res) => {
           vendor: "friDker Internacional",
           product_type: detectedCat,
           tags: detectedCat,
-          variants: updatedVariants,
           status: "active"
         }
       },
@@ -187,6 +183,27 @@ app.post("/webhook/products-create", async (req, res) => {
         }
       }
     );
+
+    /* ====== 2️⃣ Actualizar precio variante por variante ====== */
+
+    for (const variant of realVariants) {
+      await axios.put(
+        `https://${shop}/admin/api/2024-01/variants/${variant.id}.json`,
+        {
+          variant: {
+            id: variant.id,
+            price: calculatePrice(parseFloat(variant.price))
+          }
+        },
+        {
+          headers: {
+            "X-Shopify-Access-Token": accessToken
+          }
+        }
+      );
+    }
+
+    /* ====== 3️⃣ Fijar inventario ====== */
 
     const locations = await axios.get(
       `https://${shop}/admin/api/2024-01/locations.json`,
