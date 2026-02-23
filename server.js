@@ -5,6 +5,8 @@ const crypto = require("crypto");
 const { Pool } = require("pg");
 
 const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 10000;
 
 const {
@@ -25,24 +27,41 @@ const pool = new Pool({
 });
 
 async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS shop_tokens (
-      shop TEXT PRIMARY KEY,
-      access_token TEXT NOT NULL
-    );
-  `);
-  console.log("shop_tokens table ready");
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS shop_tokens (
+        shop TEXT PRIMARY KEY,
+        access_token TEXT NOT NULL
+      );
+    `);
+    console.log("shop_tokens table ready");
+  } catch (err) {
+    console.error("Database init error:", err.message);
+  }
 }
 
-initDB();
+/* ==========================
+   ROOT + HEALTH
+========================== */
+
+app.get("/", (req, res) => {
+  res.send("Fridker UsaDrop Transformer API running 🚀");
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
 
 /* ==========================
-   OAuth Install
+   SHOPIFY OAUTH INSTALL
 ========================== */
 
 app.get("/oauth/install", (req, res) => {
   const { shop } = req.query;
-  if (!shop) return res.status(400).send("Missing shop parameter");
+
+  if (!shop) {
+    return res.status(400).send("Missing shop parameter");
+  }
 
   const redirectUri = `${APP_URL}/oauth/callback`;
 
@@ -52,11 +71,15 @@ app.get("/oauth/install", (req, res) => {
 });
 
 /* ==========================
-   OAuth Callback
+   SHOPIFY OAUTH CALLBACK
 ========================== */
 
 app.get("/oauth/callback", async (req, res) => {
   const { shop, code } = req.query;
+
+  if (!shop || !code) {
+    return res.status(400).send("Missing parameters");
+  }
 
   try {
     const tokenResponse = await axios.post(
@@ -80,22 +103,26 @@ app.get("/oauth/callback", async (req, res) => {
       [shop, accessToken]
     );
 
-    console.log("Token saved in DB");
+    console.log("Token saved in DB for:", shop);
 
-    res.send("App instalada y token guardado en DB");
+    res.send("App instalada correctamente y token guardado 🚀");
+
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Error OAuth");
+    console.error("OAuth Error:", err.response?.data || err.message);
+    res.status(500).send("Error during OAuth process");
   }
 });
 
 /* ==========================
-   TEST PRODUCTS ENDPOINT
+   TEST PRODUCTS
 ========================== */
 
 app.get("/test-products", async (req, res) => {
   const { shop } = req.query;
-  if (!shop) return res.status(400).send("Missing shop parameter");
+
+  if (!shop) {
+    return res.status(400).send("Missing shop parameter");
+  }
 
   try {
     const result = await pool.query(
@@ -104,7 +131,7 @@ app.get("/test-products", async (req, res) => {
     );
 
     if (!result.rows.length) {
-      return res.status(404).send("No token found for shop");
+      return res.status(404).send("No token found for this shop");
     }
 
     const accessToken = result.rows[0].access_token;
@@ -119,24 +146,18 @@ app.get("/test-products", async (req, res) => {
     );
 
     res.json(response.data);
+
   } catch (err) {
-    console.error(err.response?.data || err.message);
+    console.error("Product fetch error:", err.response?.data || err.message);
     res.status(500).send("Error fetching products");
   }
-});
-
-/* ==========================
-   HEALTH CHECK
-========================== */
-
-app.get("/health", (req, res) => {
-  res.send("OK");
 });
 
 /* ==========================
    START SERVER
 ========================== */
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
+  await initDB();
 });
