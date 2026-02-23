@@ -10,10 +10,6 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 
 const {
-  SHOPIFY_API_KEY,
-  SHOPIFY_API_SECRET,
-  SHOPIFY_SCOPES,
-  APP_URL,
   DATABASE_URL,
   OPENAI_API_KEY
 } = process.env;
@@ -83,9 +79,12 @@ async function translateText(text) {
 }
 
 async function translateHtmlPreservingTags(html) {
+  if (!html) return html;
+
   const $ = cheerio.load(html, { decodeEntities: false });
 
   const textNodes = [];
+
   function walk(node) {
     if (!node) return;
     if (node.type === "text") {
@@ -94,6 +93,7 @@ async function translateHtmlPreservingTags(html) {
     }
     if (node.children) node.children.forEach(walk);
   }
+
   walk($.root()[0]);
 
   for (const node of textNodes) {
@@ -108,7 +108,11 @@ async function getToken(shop) {
     "SELECT access_token FROM shop_tokens WHERE shop = $1",
     [shop]
   );
-  if (!result.rows.length) throw new Error("Token not found");
+
+  if (!result.rows.length) {
+    throw new Error("Token not found for shop");
+  }
+
   return result.rows[0].access_token;
 }
 
@@ -120,18 +124,25 @@ app.post("/webhook/products-create", async (req, res) => {
   res.status(200).send("ok");
 
   const shop = req.headers["x-shopify-shop-domain"];
-  if (!shop) return;
+  if (!shop) {
+    console.log("No shop header received");
+    return;
+  }
 
   try {
+    console.log("Webhook received from:", shop);
+
     const accessToken = await getToken(shop);
     const product = req.body;
+
+    console.log("Original title:", product.title);
 
     const translatedTitle = await translateText(product.title);
     const translatedHtml = await translateHtmlPreservingTags(product.body_html);
 
     const updatedVariants = product.variants.map(v => ({
       id: v.id,
-      price: calculatePrice(parseFloat(v.price)),
+      price: calculatePrice(parseFloat(v.price))
     }));
 
     await axios.put(
@@ -155,7 +166,9 @@ app.post("/webhook/products-create", async (req, res) => {
     const locations = await axios.get(
       `https://${shop}/admin/api/2024-01/locations.json`,
       {
-        headers: { "X-Shopify-Access-Token": accessToken }
+        headers: {
+          "X-Shopify-Access-Token": accessToken
+        }
       }
     );
 
@@ -170,7 +183,9 @@ app.post("/webhook/products-create", async (req, res) => {
           available: FIXED_STOCK
         },
         {
-          headers: { "X-Shopify-Access-Token": accessToken }
+          headers: {
+            "X-Shopify-Access-Token": accessToken
+          }
         }
       );
     }
@@ -178,7 +193,7 @@ app.post("/webhook/products-create", async (req, res) => {
     console.log("Producto transformado correctamente");
 
   } catch (err) {
-    console.error("Error webhook:", err.message);
+    console.error("Error webhook full:", err.response?.data || err.message);
   }
 });
 
