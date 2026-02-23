@@ -2,7 +2,6 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const { Pool } = require("pg");
-const cheerio = require("cheerio");
 
 const app = express();
 app.use(express.json());
@@ -78,29 +77,36 @@ async function translateText(text) {
   return response.data.choices[0].message.content;
 }
 
+/* 🔥 NUEVA VERSIÓN OPTIMIZADA — UNA SOLA LLAMADA */
+
 async function translateHtmlPreservingTags(html) {
-  if (!html) return html;
+  if (!html || !html.trim()) return html;
 
-  const $ = cheerio.load(html, { decodeEntities: false });
-
-  const textNodes = [];
-
-  function walk(node) {
-    if (!node) return;
-    if (node.type === "text") {
-      const raw = node.data;
-      if (raw && raw.trim()) textNodes.push(node);
+  const response = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "Traduce al español de México. Mantén exactamente las mismas etiquetas HTML. No agregues etiquetas nuevas. No elimines etiquetas. Solo traduce el texto visible."
+        },
+        {
+          role: "user",
+          content: html
+        }
+      ],
+      temperature: 0
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      }
     }
-    if (node.children) node.children.forEach(walk);
-  }
+  );
 
-  walk($.root()[0]);
-
-  for (const node of textNodes) {
-    node.data = await translateText(node.data);
-  }
-
-  return $.root().html();
+  return response.data.choices[0].message.content;
 }
 
 async function getToken(shop) {
