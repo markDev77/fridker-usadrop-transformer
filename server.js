@@ -1,8 +1,8 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
-const crypto = require("crypto");
 const { Pool } = require("pg");
+const cheerio = require("cheerio");
 
 const app = express();
 app.use(express.json());
@@ -14,8 +14,19 @@ const {
   SHOPIFY_API_SECRET,
   SHOPIFY_SCOPES,
   APP_URL,
-  DATABASE_URL
+  DATABASE_URL,
+  OPENAI_API_KEY
 } = process.env;
+
+/* ==========================
+   CONFIG NEGOCIO
+========================== */
+
+const USD_TO_MXN = 20;
+const BASE_FEE = 200;
+const MARGIN_1 = 1.15;
+const MARGIN_2 = 1.20;
+const FIXED_STOCK = 11;
 
 /* ==========================
    PostgreSQL
@@ -27,117 +38,113 @@ const pool = new Pool({
 });
 
 async function initDB() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS shop_tokens (
-        shop TEXT PRIMARY KEY,
-        access_token TEXT NOT NULL
-      );
-    `);
-    console.log("shop_tokens table ready");
-  } catch (err) {
-    console.error("Database init error:", err.message);
-  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_tokens (
+      shop TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL
+    );
+  `);
+  console.log("shop_tokens table ready");
 }
 
 /* ==========================
-   ROOT + HEALTH
+   UTILIDADES
 ========================== */
 
-app.get("/", (req, res) => {
-  res.send("Fridker UsaDrop Transformer API running 🚀");
-});
+function calculatePrice(usd) {
+  let mxn = usd * USD_TO_MXN;
+  mxn += BASE_FEE;
+  mxn *= MARGIN_1;
+  mxn *= MARGIN_2;
+  return Math.ceil(mxn);
+}
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
+async function translateText(text) {
+  if (!text || !text.trim()) return text;
 
-/* ==========================
-   SHOPIFY OAUTH INSTALL
-========================== */
-
-app.get("/oauth/install", (req, res) => {
-  const { shop } = req.query;
-
-  if (!shop) {
-    return res.status(400).send("Missing shop parameter");
-  }
-
-  const redirectUri = `${APP_URL}/oauth/callback`;
-
-  const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_API_KEY}&scope=${SHOPIFY_SCOPES}&redirect_uri=${redirectUri}`;
-
-  res.redirect(installUrl);
-});
-
-/* ==========================
-   SHOPIFY OAUTH CALLBACK
-========================== */
-
-app.get("/oauth/callback", async (req, res) => {
-  const { shop, code } = req.query;
-
-  if (!shop || !code) {
-    return res.status(400).send("Missing parameters");
-  }
-
-  try {
-    const tokenResponse = await axios.post(
-      `https://${shop}/admin/oauth/access_token`,
-      {
-        client_id: SHOPIFY_API_KEY,
-        client_secret: SHOPIFY_API_SECRET,
-        code
+  const response = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "Traduce al español de México." },
+        { role: "user", content: text }
+      ],
+      temperature: 0
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`
       }
-    );
+    }
+  );
 
-    const accessToken = tokenResponse.data.access_token;
+  return response.data.choices[0].message.content;
+}
 
-    await pool.query(
-      `
-      INSERT INTO shop_tokens (shop, access_token)
-      VALUES ($1, $2)
-      ON CONFLICT (shop)
-      DO UPDATE SET access_token = EXCLUDED.access_token
-      `,
-      [shop, accessToken]
-    );
+async function translateHtmlPreservingTags(html) {
+  const $ = cheerio.load(html, { decodeEntities: false });
 
-    console.log("Token saved in DB for:", shop);
-
-    res.send("App instalada correctamente y token guardado 🚀");
-
-  } catch (err) {
-    console.error("OAuth Error:", err.response?.data || err.message);
-    res.status(500).send("Error during OAuth process");
+  const textNodes = [];
+  function walk(node) {
+    if (!node) return;
+    if (node.type === "text") {
+      const raw = node.data;
+      if (raw && raw.trim()) textNodes.push(node);
+    }
+    if (node.children) node.children.forEach(walk);
   }
-});
+  walk($.root()[0]);
+
+  for (const node of textNodes) {
+    node.data = await translateText(node.data);
+  }
+
+  return $.root().html();
+}
+
+async function getToken(shop) {
+  const result = await pool.query(
+    "SELECT access_token FROM shop_tokens WHERE shop = $1",
+    [shop]
+  );
+  if (!result.rows.length) throw new Error("Token not found");
+  return result.rows[0].access_token;
+}
 
 /* ==========================
-   TEST PRODUCTS
+   WEBHOOK PRODUCTS CREATE
 ========================== */
 
-app.get("/test-products", async (req, res) => {
-  const { shop } = req.query;
+app.post("/webhook/products-create", async (req, res) => {
+  res.status(200).send("ok");
 
-  if (!shop) {
-    return res.status(400).send("Missing shop parameter");
-  }
+  const shop = req.headers["x-shopify-shop-domain"];
+  if (!shop) return;
 
   try {
-    const result = await pool.query(
-      "SELECT access_token FROM shop_tokens WHERE shop = $1",
-      [shop]
-    );
+    const accessToken = await getToken(shop);
+    const product = req.body;
 
-    if (!result.rows.length) {
-      return res.status(404).send("No token found for this shop");
-    }
+    const translatedTitle = await translateText(product.title);
+    const translatedHtml = await translateHtmlPreservingTags(product.body_html);
 
-    const accessToken = result.rows[0].access_token;
+    const updatedVariants = product.variants.map(v => ({
+      id: v.id,
+      price: calculatePrice(parseFloat(v.price)),
+    }));
 
-    const response = await axios.get(
-      `https://${shop}/admin/api/2024-01/products.json`,
+    await axios.put(
+      `https://${shop}/admin/api/2024-01/products/${product.id}.json`,
+      {
+        product: {
+          id: product.id,
+          title: translatedTitle,
+          body_html: translatedHtml,
+          variants: updatedVariants,
+          status: "active"
+        }
+      },
       {
         headers: {
           "X-Shopify-Access-Token": accessToken
@@ -145,17 +152,43 @@ app.get("/test-products", async (req, res) => {
       }
     );
 
-    res.json(response.data);
+    const locations = await axios.get(
+      `https://${shop}/admin/api/2024-01/locations.json`,
+      {
+        headers: { "X-Shopify-Access-Token": accessToken }
+      }
+    );
+
+    const locationId = locations.data.locations[0].id;
+
+    for (const variant of product.variants) {
+      await axios.post(
+        `https://${shop}/admin/api/2024-01/inventory_levels/set.json`,
+        {
+          location_id: locationId,
+          inventory_item_id: variant.inventory_item_id,
+          available: FIXED_STOCK
+        },
+        {
+          headers: { "X-Shopify-Access-Token": accessToken }
+        }
+      );
+    }
+
+    console.log("Producto transformado correctamente");
 
   } catch (err) {
-    console.error("Product fetch error:", err.response?.data || err.message);
-    res.status(500).send("Error fetching products");
+    console.error("Error webhook:", err.message);
   }
 });
 
 /* ==========================
-   START SERVER
+   HEALTH
 ========================== */
+
+app.get("/", (req, res) => {
+  res.send("Transformer running 🚀");
+});
 
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
