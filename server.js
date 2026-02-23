@@ -2,9 +2,14 @@ const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
 const cheerio = require("cheerio");
+const cookieParser = require("cookie-parser");
 
 const app = express();
+
+// IMPORTANTE: para verificación de webhooks con HMAC real se requiere RAW body.
+// Por ahora dejamos JSON normal (sin romper), y la verificación queda "opcional".
 app.use(express.json({ limit: "10mb" }));
+app.use(cookieParser());
 
 // ===============================
 // CONFIG (tu regla de negocio)
@@ -18,11 +23,19 @@ const FIXED_STOCK = 11;
 // ===============================
 // SHOPIFY CONFIG (Render env vars)
 // ===============================
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g. eawi7g-hj.myshopify.com
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API access token
+let SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g. eawi7g-hj.myshopify.com (se setea luego en OAuth)
+let SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API access token (se setea luego en OAuth)
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-01";
 
-// (opcional pero recomendado) verificar webhooks
+// OAuth (OBLIGATORIO para instalar app)
+const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY;
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
+const APP_URL = process.env.APP_URL || "https://fridker-usadrop-transformer.onrender.com";
+const SHOPIFY_SCOPES =
+  process.env.SHOPIFY_SCOPES ||
+  "write_products,read_products,write_inventory,read_inventory,read_locations";
+
+// (opcional) verificar webhooks
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
 // ===============================
@@ -33,7 +46,7 @@ function calculatePrice(usd) {
   mxn += BASE_FEE;
   mxn *= MARGIN_1;
   mxn *= MARGIN_2;
-  return Math.ceil(mxn); // redondear hacia arriba
+  return Math.ceil(mxn);
 }
 
 // ===============================
@@ -62,7 +75,6 @@ async function translateHtmlTextNodes(html) {
 
   const $ = cheerio.load(html, { decodeEntities: false });
 
-  // Recorremos nodos de texto (excluye script/style)
   const textNodes = [];
   function walk(node) {
     if (!node) return;
@@ -76,7 +88,6 @@ async function translateHtmlTextNodes(html) {
   }
   walk($.root()[0]);
 
-  // Traducir en serie (simple y estable para MVP)
   for (const node of textNodes) {
     const original = node.data;
     const translated = await translateText(original);
@@ -87,7 +98,7 @@ async function translateHtmlTextNodes(html) {
 }
 
 // ===============================
-// SHOPIFY HELPERS
+// SHOPIFY HELPERS (Admin REST)
 // ===============================
 function shopifyHeaders() {
   return {
@@ -122,7 +133,6 @@ async function getFirstLocationId() {
 }
 
 async function setInventory(inventory_item_id, location_id, available) {
-  // inventory_levels/set.json (Admin REST)
   return shopifyPost("inventory_levels/set.json", {
     location_id,
     inventory_item_id,
@@ -131,10 +141,147 @@ async function setInventory(inventory_item_id, location_id, available) {
 }
 
 // ===============================
+// OAUTH INSTALL FLOW (LO QUE TE FALTA)
+// ===============================
+function safeCompare(a, b) {
+  try {
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch {
+    return false;
+  }
+}
+
+function verifyQueryHmac(query) {
+  // Shopify manda ?hmac=...&...  Se verifica con API_SECRET
+  const { hmac, signature, ...rest } = query;
+
+  // 1) construir message ordenado alfabéticamente: key=value&key2=value2
+  const message = Object.keys(rest)
+    .sort()
+    .map((k) => `${k}=${Array.isArray(rest[k]) ? rest[k].join(",") : rest[k]}`)
+    .join("&");
+
+  // 2) hmac sha256 hex
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_API_SECRET)
+    .update(message)
+    .digest("hex");
+
+  return safeCompare(digest, hmac || "");
+}
+
+function buildAuthUrl(shop, state) {
+  const redirectUri = `${APP_URL}/oauth/callback`;
+  const installUrl = `https://${shop}/admin/oauth/authorize` +
+    `?client_id=${encodeURIComponent(SHOPIFY_API_KEY)}` +
+    `&scope=${encodeURIComponent(SHOPIFY_SCOPES)}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&state=${encodeURIComponent(state)}`;
+  return installUrl;
+}
+
+// 1) Inicia instalación
+app.get("/oauth/install", (req, res) => {
+  try {
+    if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
+      return res
+        .status(500)
+        .send("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in env vars");
+    }
+
+    const shop = (req.query.shop || "").toString();
+    if (!shop || !shop.endsWith(".myshopify.com")) {
+      return res.status(400).send("Missing/invalid shop param");
+    }
+
+    const state = crypto.randomBytes(16).toString("hex");
+    res.cookie("shopify_oauth_state", state, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: true,
+    });
+
+    const authUrl = buildAuthUrl(shop, state);
+    return res.redirect(authUrl);
+  } catch (e) {
+    return res.status(500).send(`OAuth install error: ${e?.message || e}`);
+  }
+});
+
+// 2) Callback de Shopify (obtiene access_token)
+app.get("/oauth/callback", async (req, res) => {
+  try {
+    if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
+      return res
+        .status(500)
+        .send("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in env vars");
+    }
+
+    const shop = (req.query.shop || "").toString();
+    const code = (req.query.code || "").toString();
+    const state = (req.query.state || "").toString();
+
+    const stateCookie = req.cookies?.shopify_oauth_state;
+    if (!stateCookie || stateCookie !== state) {
+      return res.status(403).send("Invalid OAuth state");
+    }
+
+    // Verifica HMAC de query
+    if (!verifyQueryHmac(req.query)) {
+      return res.status(403).send("Invalid HMAC");
+    }
+
+    if (!shop || !code) {
+      return res.status(400).send("Missing shop or code");
+    }
+
+    // Exchange code -> access_token
+    const tokenUrl = `https://${shop}/admin/oauth/access_token`;
+    const tokenRes = await axios.post(tokenUrl, {
+      client_id: SHOPIFY_API_KEY,
+      client_secret: SHOPIFY_API_SECRET,
+      code,
+    });
+
+    const accessToken = tokenRes?.data?.access_token;
+    if (!accessToken) {
+      return res.status(500).send("No access_token received from Shopify");
+    }
+
+    // Guardamos en memoria (MVP). Para prod: DB / KV.
+    SHOPIFY_STORE_DOMAIN = shop;
+    SHOPIFY_ADMIN_TOKEN = accessToken;
+
+    // Limpia cookie state
+    res.clearCookie("shopify_oauth_state");
+
+    // Opcional: crea webhook de products/create apuntando a tu endpoint
+    // (Puedes descomentarlo después de confirmar que tu endpoint está OK)
+    /*
+    await shopifyPost("webhooks.json", {
+      webhook: {
+        topic: "products/create",
+        address: `${APP_URL}/webhook/products-create`,
+        format: "json",
+      },
+    });
+    */
+
+    return res.send(
+      `✅ App instalada y token guardado en servidor (MVP). Shop: ${shop}. Ya puedes probar webhooks/transform.`
+    );
+  } catch (e) {
+    return res.status(500).send(`OAuth callback error: ${e?.message || e}`);
+  }
+});
+
+// ===============================
 // WEBHOOK VERIFICATION (opcional)
+// NOTA: con express.json() el body cambia y puede fallar HMAC.
+// Aquí lo dejamos "permisivo" para no bloquear.
 // ===============================
 function verifyShopifyWebhook(req) {
-  if (!SHOPIFY_WEBHOOK_SECRET) return true; // si no lo configuras, no bloqueamos
+  if (!SHOPIFY_WEBHOOK_SECRET) return true;
 
   const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
   if (!hmacHeader) return false;
@@ -145,11 +292,11 @@ function verifyShopifyWebhook(req) {
     .update(body, "utf8")
     .digest("base64");
 
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+  return safeCompare(digest, hmacHeader);
 }
 
 // ===============================
-// ENDPOINT: manual transform (lo que ya tenías)
+// ENDPOINT: manual transform
 // ===============================
 app.post("/transform", async (req, res) => {
   try {
@@ -173,7 +320,6 @@ app.post("/transform", async (req, res) => {
 
 // ===============================
 // ENDPOINT: Shopify webhook when product created
-// UsaDrop crea producto -> Shopify manda webhook aquí -> actualizamos Shopify
 // ===============================
 app.post("/webhook/products-create", async (req, res) => {
   try {
@@ -228,7 +374,6 @@ app.post("/webhook/products-create", async (req, res) => {
     // 6) Inventario 11 por variante (por location)
     const locationId = await getFirstLocationId();
     for (const v of product.variants || []) {
-      // inventory_item_id viene en la variante
       if (v.inventory_item_id) {
         await setInventory(v.inventory_item_id, locationId, FIXED_STOCK);
       }
