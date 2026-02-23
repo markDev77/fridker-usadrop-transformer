@@ -1,19 +1,15 @@
 {
   "name": "fridker-usadrop-transformer",
   "version": "1.0.0",
-  "description": "Shopify product transformer with OAuth and webhook support",
+  "description": "Shopify OAuth + PostgreSQL persistence",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
     "axios": "^1.6.0",
-    "cheerio": "^1.0.0-rc.12",
-    "cookie-parser": "^1.4.6",
+    "dotenv": "^16.4.5",
     "express": "^4.18.2",
-    "pg": "^8.11.3"
+    "pg": "^8.11.5"
   }
 }
