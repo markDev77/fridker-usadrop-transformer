@@ -1,15 +1,18 @@
 {
   "name": "fridker-usadrop-transformer",
   "version": "1.0.0",
-  "description": "Backend transformer for USA Drop products",
+  "description": "Shopify transformer app for fridker",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
     "axios": "^1.6.0",
-    "cheerio": "^1.0.0-rc.12"
+    "cheerio": "^1.0.0-rc.12",
+    "cookie-parser": "^1.4.6",
+    "express": "^4.18.2"
   }
 }
