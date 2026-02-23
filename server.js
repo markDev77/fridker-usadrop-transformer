@@ -23,7 +23,7 @@ const BASE_FEE = 200;
 const MARGIN_1 = 1.15;
 const MARGIN_2 = 1.20;
 const FIXED_STOCK = 11;
-const DEFAULT_WEIGHT = 1; // 🔥 NUEVO
+const DEFAULT_WEIGHT = 1;
 
 /* ==========================
    PostgreSQL
@@ -58,12 +58,10 @@ function calculatePrice(usd) {
 
 function detectCategory(title) {
   const t = title.toLowerCase();
-
   if (t.includes("bag") || t.includes("bolsa")) return "BOLSOS";
   if (t.includes("massage") || t.includes("masaje")) return "TERAPIA";
   if (t.includes("led")) return "ILUMINACION";
   if (t.includes("chair")) return "HOGAR";
-
   return "GENERAL";
 }
 
@@ -140,16 +138,12 @@ app.post("/webhook/products-create", async (req, res) => {
     const accessToken = await getToken(shop);
     const product = req.body;
 
-    console.log("Webhook recibido:", product.title);
-
     await new Promise(resolve => setTimeout(resolve, 1500));
 
     const freshProduct = await axios.get(
       `https://${shop}/admin/api/2024-01/products/${product.id}.json`,
       {
-        headers: {
-          "X-Shopify-Access-Token": accessToken
-        }
+        headers: { "X-Shopify-Access-Token": accessToken }
       }
     );
 
@@ -158,10 +152,7 @@ app.post("/webhook/products-create", async (req, res) => {
 
     const translatedTitle = await translateText(realProduct.title);
     const translatedHtml = await translateHtmlPreservingTags(realProduct.body_html);
-
     const detectedCat = detectCategory(realProduct.title);
-
-    /* ====== 1️⃣ Actualizar producto ====== */
 
     await axios.put(
       `https://${shop}/admin/api/2024-01/products/${product.id}.json`,
@@ -177,13 +168,9 @@ app.post("/webhook/products-create", async (req, res) => {
         }
       },
       {
-        headers: {
-          "X-Shopify-Access-Token": accessToken
-        }
+        headers: { "X-Shopify-Access-Token": accessToken }
       }
     );
-
-    /* ====== 2️⃣ Actualizar variantes ====== */
 
     for (const variant of realVariants) {
       await axios.put(
@@ -191,33 +178,21 @@ app.post("/webhook/products-create", async (req, res) => {
         {
           variant: {
             id: variant.id,
-
-            // Precio
             price: calculatePrice(parseFloat(variant.price)),
-
-            // 🔥 SKU EXACTO (respeta PD.xxx)
             sku: variant.sku,
-
-            // 🔥 Peso fijo 1kg
             weight: DEFAULT_WEIGHT,
             weight_unit: "kg"
           }
         },
         {
-          headers: {
-            "X-Shopify-Access-Token": accessToken
-          }
+          headers: { "X-Shopify-Access-Token": accessToken }
         }
       );
     }
 
-    /* ====== 3️⃣ Fijar inventario ====== */
-
     const locations = await axios.get(
       `https://${shop}/admin/api/2024-01/locations.json`,
-      {
-        headers: { "X-Shopify-Access-Token": accessToken }
-      }
+      { headers: { "X-Shopify-Access-Token": accessToken } }
     );
 
     const locationId = locations.data.locations[0].id;
@@ -240,6 +215,50 @@ app.post("/webhook/products-create", async (req, res) => {
 
   } catch (err) {
     console.error("Error webhook full:", err.response?.data || err.message);
+  }
+});
+
+/* ==========================
+   WEBHOOK FULFILLMENT (TRACKING JM)
+========================== */
+
+app.post("/webhook/fulfillment", async (req, res) => {
+  res.status(200).send("ok");
+
+  const shop = req.headers["x-shopify-shop-domain"];
+  if (!shop) return;
+
+  try {
+    const accessToken = await getToken(shop);
+    const fulfillment = req.body;
+
+    if (!fulfillment.tracking_number) return;
+
+    const trackingNumber = fulfillment.tracking_number;
+
+    if (!trackingNumber.startsWith("JM")) return;
+
+    const trackingUrl = `https://www.aftership.com/track/360lion/${trackingNumber}`;
+
+    await axios.put(
+      `https://${shop}/admin/api/2024-01/fulfillments/${fulfillment.id}.json`,
+      {
+        fulfillment: {
+          id: fulfillment.id,
+          tracking_urls: [trackingUrl],
+          tracking_numbers: [trackingNumber],
+          tracking_company: "360lion"
+        }
+      },
+      {
+        headers: { "X-Shopify-Access-Token": accessToken }
+      }
+    );
+
+    console.log("Tracking URL integrada:", trackingUrl);
+
+  } catch (err) {
+    console.error("Error fulfillment:", err.response?.data || err.message);
   }
 });
 
