@@ -2,7 +2,7 @@
   "name": "fridker-usadrop-transformer",
   "version": "1.0.0",
   "description": "UsaDrop Transformer Service",
-  "main": "src/server.js",
+  "main": "server.js",
   "scripts": {
     "start": "node src/server.js"
   },
