@@ -3,11 +3,14 @@ const axios = require("axios");
 const crypto = require("crypto");
 const cheerio = require("cheerio");
 const cookieParser = require("cookie-parser");
+const { Pool } = require("pg");
 
 const app = express();
 
-// IMPORTANTE: para verificación de webhooks con HMAC real se requiere RAW body.
-// Por ahora dejamos JSON normal (sin romper), y la verificación queda "opcional".
+/**
+ * Si quieres HMAC real de webhooks, necesitas RAW body.
+ * Aquí dejamos JSON para no romper, pero te dejo hook RAW opcional abajo.
+ */
 app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
 
@@ -21,13 +24,9 @@ const MARGIN_2 = 1.20; // 20% margen fridker
 const FIXED_STOCK = 11;
 
 // ===============================
-// SHOPIFY CONFIG (Render env vars)
+// SHOPIFY CONFIG
 // ===============================
-let SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g. eawi7g-hj.myshopify.com (se setea luego en OAuth)
-let SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API access token (se setea luego en OAuth)
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-01";
-
-// OAuth (OBLIGATORIO para instalar app)
 const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY;
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 const APP_URL = process.env.APP_URL || "https://fridker-usadrop-transformer.onrender.com";
@@ -35,8 +34,55 @@ const SHOPIFY_SCOPES =
   process.env.SHOPIFY_SCOPES ||
   "write_products,read_products,write_inventory,read_inventory,read_locations";
 
-// (opcional) verificar webhooks
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
+
+// ===============================
+// DB (Postgres)
+// ===============================
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.warn("⚠️ Missing DATABASE_URL. Tokens no se persistirán (solo MVP).");
+}
+
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false }, // Render Postgres suele requerir SSL
+    })
+  : null;
+
+async function ensureSchema() {
+  if (!pool) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_tokens (
+      shop TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+}
+
+async function saveShopToken(shop, token) {
+  if (!pool) return;
+  await ensureSchema();
+  await pool.query(
+    `
+    INSERT INTO shop_tokens (shop, access_token, created_at, updated_at)
+    VALUES ($1, $2, NOW(), NOW())
+    ON CONFLICT (shop)
+    DO UPDATE SET access_token = EXCLUDED.access_token, updated_at = NOW();
+  `,
+    [shop, token]
+  );
+}
+
+async function getShopToken(shop) {
+  if (!pool) return null;
+  await ensureSchema();
+  const r = await pool.query(`SELECT access_token FROM shop_tokens WHERE shop = $1 LIMIT 1`, [shop]);
+  return r.rows?.[0]?.access_token || null;
+}
 
 // ===============================
 // PRICE LOGIC
@@ -50,8 +96,7 @@ function calculatePrice(usd) {
 }
 
 // ===============================
-// TRANSLATION (placeholder actual)
-// Cambiaremos luego a GPT sin romper flujo.
+// TRANSLATION (placeholder)
 // ===============================
 async function translateText(text) {
   if (!text || !text.trim()) return text;
@@ -69,7 +114,6 @@ async function translateText(text) {
   }
 }
 
-// Traduce SOLO texto dentro de HTML, preserva tags.
 async function translateHtmlTextNodes(html) {
   if (!html || !html.trim()) return html;
 
@@ -82,66 +126,19 @@ async function translateHtmlTextNodes(html) {
       const raw = node.data;
       if (raw && raw.trim()) textNodes.push(node);
     }
-    if (node.children && node.children.length) {
-      node.children.forEach(walk);
-    }
+    if (node.children && node.children.length) node.children.forEach(walk);
   }
   walk($.root()[0]);
 
   for (const node of textNodes) {
-    const original = node.data;
-    const translated = await translateText(original);
-    node.data = translated;
+    node.data = await translateText(node.data);
   }
 
   return $.root().html();
 }
 
 // ===============================
-// SHOPIFY HELPERS (Admin REST)
-// ===============================
-function shopifyHeaders() {
-  return {
-    "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-    "Content-Type": "application/json",
-  };
-}
-
-async function shopifyGet(path) {
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/${path}`;
-  const res = await axios.get(url, { headers: shopifyHeaders() });
-  return res.data;
-}
-
-async function shopifyPut(path, payload) {
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/${path}`;
-  const res = await axios.put(url, payload, { headers: shopifyHeaders() });
-  return res.data;
-}
-
-async function shopifyPost(path, payload) {
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/${path}`;
-  const res = await axios.post(url, payload, { headers: shopifyHeaders() });
-  return res.data;
-}
-
-async function getFirstLocationId() {
-  const data = await shopifyGet("locations.json");
-  const loc = data?.locations?.[0];
-  if (!loc?.id) throw new Error("No Shopify locations found");
-  return loc.id;
-}
-
-async function setInventory(inventory_item_id, location_id, available) {
-  return shopifyPost("inventory_levels/set.json", {
-    location_id,
-    inventory_item_id,
-    available,
-  });
-}
-
-// ===============================
-// OAUTH INSTALL FLOW (LO QUE TE FALTA)
+// SECURITY HELPERS
 // ===============================
 function safeCompare(a, b) {
   try {
@@ -152,16 +149,13 @@ function safeCompare(a, b) {
 }
 
 function verifyQueryHmac(query) {
-  // Shopify manda ?hmac=...&...  Se verifica con API_SECRET
   const { hmac, signature, ...rest } = query;
 
-  // 1) construir message ordenado alfabéticamente: key=value&key2=value2
   const message = Object.keys(rest)
     .sort()
     .map((k) => `${k}=${Array.isArray(rest[k]) ? rest[k].join(",") : rest[k]}`)
     .join("&");
 
-  // 2) hmac sha256 hex
   const digest = crypto
     .createHmac("sha256", SHOPIFY_API_SECRET)
     .update(message)
@@ -172,21 +166,65 @@ function verifyQueryHmac(query) {
 
 function buildAuthUrl(shop, state) {
   const redirectUri = `${APP_URL}/oauth/callback`;
-  const installUrl = `https://${shop}/admin/oauth/authorize` +
+  return (
+    `https://${shop}/admin/oauth/authorize` +
     `?client_id=${encodeURIComponent(SHOPIFY_API_KEY)}` +
     `&scope=${encodeURIComponent(SHOPIFY_SCOPES)}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&state=${encodeURIComponent(state)}`;
-  return installUrl;
+    `&state=${encodeURIComponent(state)}`
+  );
 }
 
-// 1) Inicia instalación
+// ===============================
+// SHOPIFY HELPERS (Admin REST)
+// ===============================
+function shopifyHeaders(accessToken) {
+  return {
+    "X-Shopify-Access-Token": accessToken,
+    "Content-Type": "application/json",
+  };
+}
+
+async function shopifyGet(shop, accessToken, path) {
+  const url = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/${path}`;
+  const res = await axios.get(url, { headers: shopifyHeaders(accessToken) });
+  return res.data;
+}
+
+async function shopifyPut(shop, accessToken, path, payload) {
+  const url = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/${path}`;
+  const res = await axios.put(url, payload, { headers: shopifyHeaders(accessToken) });
+  return res.data;
+}
+
+async function shopifyPost(shop, accessToken, path, payload) {
+  const url = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/${path}`;
+  const res = await axios.post(url, payload, { headers: shopifyHeaders(accessToken) });
+  return res.data;
+}
+
+async function getFirstLocationId(shop, accessToken) {
+  const data = await shopifyGet(shop, accessToken, "locations.json");
+  const loc = data?.locations?.[0];
+  if (!loc?.id) throw new Error("No Shopify locations found");
+  return loc.id;
+}
+
+async function setInventory(shop, accessToken, inventory_item_id, location_id, available) {
+  return shopifyPost(shop, accessToken, "inventory_levels/set.json", {
+    location_id,
+    inventory_item_id,
+    available,
+  });
+}
+
+// ===============================
+// OAUTH INSTALL FLOW
+// ===============================
 app.get("/oauth/install", (req, res) => {
   try {
     if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
-      return res
-        .status(500)
-        .send("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in env vars");
+      return res.status(500).send("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in env vars");
     }
 
     const shop = (req.query.shop || "").toString();
@@ -201,20 +239,16 @@ app.get("/oauth/install", (req, res) => {
       secure: true,
     });
 
-    const authUrl = buildAuthUrl(shop, state);
-    return res.redirect(authUrl);
+    return res.redirect(buildAuthUrl(shop, state));
   } catch (e) {
     return res.status(500).send(`OAuth install error: ${e?.message || e}`);
   }
 });
 
-// 2) Callback de Shopify (obtiene access_token)
 app.get("/oauth/callback", async (req, res) => {
   try {
     if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
-      return res
-        .status(500)
-        .send("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in env vars");
+      return res.status(500).send("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in env vars");
     }
 
     const shop = (req.query.shop || "").toString();
@@ -222,20 +256,10 @@ app.get("/oauth/callback", async (req, res) => {
     const state = (req.query.state || "").toString();
 
     const stateCookie = req.cookies?.shopify_oauth_state;
-    if (!stateCookie || stateCookie !== state) {
-      return res.status(403).send("Invalid OAuth state");
-    }
+    if (!stateCookie || stateCookie !== state) return res.status(403).send("Invalid OAuth state");
+    if (!verifyQueryHmac(req.query)) return res.status(403).send("Invalid HMAC");
+    if (!shop || !code) return res.status(400).send("Missing shop or code");
 
-    // Verifica HMAC de query
-    if (!verifyQueryHmac(req.query)) {
-      return res.status(403).send("Invalid HMAC");
-    }
-
-    if (!shop || !code) {
-      return res.status(400).send("Missing shop or code");
-    }
-
-    // Exchange code -> access_token
     const tokenUrl = `https://${shop}/admin/oauth/access_token`;
     const tokenRes = await axios.post(tokenUrl, {
       client_id: SHOPIFY_API_KEY,
@@ -244,31 +268,15 @@ app.get("/oauth/callback", async (req, res) => {
     });
 
     const accessToken = tokenRes?.data?.access_token;
-    if (!accessToken) {
-      return res.status(500).send("No access_token received from Shopify");
-    }
+    if (!accessToken) return res.status(500).send("No access_token received from Shopify");
 
-    // Guardamos en memoria (MVP). Para prod: DB / KV.
-    SHOPIFY_STORE_DOMAIN = shop;
-    SHOPIFY_ADMIN_TOKEN = accessToken;
+    // ✅ Persistimos por shop (PROD)
+    await saveShopToken(shop, accessToken);
 
-    // Limpia cookie state
     res.clearCookie("shopify_oauth_state");
 
-    // Opcional: crea webhook de products/create apuntando a tu endpoint
-    // (Puedes descomentarlo después de confirmar que tu endpoint está OK)
-    /*
-    await shopifyPost("webhooks.json", {
-      webhook: {
-        topic: "products/create",
-        address: `${APP_URL}/webhook/products-create`,
-        format: "json",
-      },
-    });
-    */
-
     return res.send(
-      `✅ App instalada y token guardado en servidor (MVP). Shop: ${shop}. Ya puedes probar webhooks/transform.`
+      `✅ App instalada y token guardado en DB. Shop: ${shop}. Ya puedes probar webhooks/transform.`
     );
   } catch (e) {
     return res.status(500).send(`OAuth callback error: ${e?.message || e}`);
@@ -277,8 +285,6 @@ app.get("/oauth/callback", async (req, res) => {
 
 // ===============================
 // WEBHOOK VERIFICATION (opcional)
-// NOTA: con express.json() el body cambia y puede fallar HMAC.
-// Aquí lo dejamos "permisivo" para no bloquear.
 // ===============================
 function verifyShopifyWebhook(req) {
   if (!SHOPIFY_WEBHOOK_SECRET) return true;
@@ -286,6 +292,7 @@ function verifyShopifyWebhook(req) {
   const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
   if (!hmacHeader) return false;
 
+  // ⚠️ con express.json() esto NO es perfecto. Para HMAC real necesitas raw body.
   const body = JSON.stringify(req.body);
   const digest = crypto
     .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
@@ -319,21 +326,29 @@ app.post("/transform", async (req, res) => {
 });
 
 // ===============================
-// ENDPOINT: Shopify webhook when product created
+// WEBHOOK: products/create
 // ===============================
 app.post("/webhook/products-create", async (req, res) => {
   try {
     // 1) responder rápido a Shopify
     res.status(200).send("ok");
 
-    // 2) verificar firma (si configuraste secret)
+    // 2) firma (si usas secret)
     if (!verifyShopifyWebhook(req)) {
       console.log("Webhook signature invalid");
       return;
     }
 
-    if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
-      console.log("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN");
+    // 3) obtener shop desde header oficial
+    const shop = (req.get("X-Shopify-Shop-Domain") || "").toString();
+    if (!shop || !shop.endsWith(".myshopify.com")) {
+      console.log("Webhook missing/invalid X-Shopify-Shop-Domain");
+      return;
+    }
+
+    const accessToken = await getShopToken(shop);
+    if (!accessToken) {
+      console.log(`No token found in DB for shop ${shop}. Reinstala /oauth/install?shop=${shop}`);
       return;
     }
 
@@ -343,15 +358,13 @@ app.post("/webhook/products-create", async (req, res) => {
       return;
     }
 
-    // 3) Obtener producto completo desde Shopify
-    const productData = await shopifyGet(`products/${productId}.json`);
+    const productData = await shopifyGet(shop, accessToken, `products/${productId}.json`);
     const product = productData?.product;
     if (!product) {
       console.log("Product not found via API");
       return;
     }
 
-    // 4) Transformaciones: título + HTML (solo texto) + precios por variante
     const newTitle = await translateText(product.title || "");
     const newBodyHtml = await translateHtmlTextNodes(product.body_html || "");
 
@@ -360,8 +373,7 @@ app.post("/webhook/products-create", async (req, res) => {
       price: String(calculatePrice(parseFloat(v.price || 0))),
     }));
 
-    // 5) Update product (título, descripción, precios, status activo)
-    await shopifyPut(`products/${productId}.json`, {
+    await shopifyPut(shop, accessToken, `products/${productId}.json`, {
       product: {
         id: productId,
         title: newTitle,
@@ -371,15 +383,14 @@ app.post("/webhook/products-create", async (req, res) => {
       },
     });
 
-    // 6) Inventario 11 por variante (por location)
-    const locationId = await getFirstLocationId();
+    const locationId = await getFirstLocationId(shop, accessToken);
     for (const v of product.variants || []) {
       if (v.inventory_item_id) {
-        await setInventory(v.inventory_item_id, locationId, FIXED_STOCK);
+        await setInventory(shop, accessToken, v.inventory_item_id, locationId, FIXED_STOCK);
       }
     }
 
-    console.log(`Updated product ${productId}: title/body/prices + inventory=11`);
+    console.log(`Updated product ${productId} @ ${shop}: title/body/prices + inventory=11`);
   } catch (e) {
     console.log("Webhook processing error:", e?.message || e);
   }
