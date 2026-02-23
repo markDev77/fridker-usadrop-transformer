@@ -8,10 +8,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-const {
-  DATABASE_URL,
-  OPENAI_API_KEY
-} = process.env;
+const { DATABASE_URL } = process.env;
 
 /* ==========================
    CONFIG NEGOCIO
@@ -54,61 +51,6 @@ function calculatePrice(usd) {
   return Math.ceil(mxn);
 }
 
-async function translateText(text) {
-  if (!text || !text.trim()) return text;
-
-  const response = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "Traduce al español de México." },
-        { role: "user", content: text }
-      ],
-      temperature: 0
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`
-      }
-    }
-  );
-
-  return response.data.choices[0].message.content;
-}
-
-/* 🔥 NUEVA VERSIÓN OPTIMIZADA — UNA SOLA LLAMADA */
-
-async function translateHtmlPreservingTags(html) {
-  if (!html || !html.trim()) return html;
-
-  const response = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "Traduce al español de México. Mantén exactamente las mismas etiquetas HTML. No agregues etiquetas nuevas. No elimines etiquetas. Solo traduce el texto visible."
-        },
-        {
-          role: "user",
-          content: html
-        }
-      ],
-      temperature: 0
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`
-      }
-    }
-  );
-
-  return response.data.choices[0].message.content;
-}
-
 async function getToken(shop) {
   const result = await pool.query(
     "SELECT access_token FROM shop_tokens WHERE shop = $1",
@@ -141,23 +83,17 @@ app.post("/webhook/products-create", async (req, res) => {
     const accessToken = await getToken(shop);
     const product = req.body;
 
-    console.log("Original title:", product.title);
-
-    const translatedTitle = await translateText(product.title);
-    const translatedHtml = await translateHtmlPreservingTags(product.body_html);
-
     const updatedVariants = product.variants.map(v => ({
       id: v.id,
       price: calculatePrice(parseFloat(v.price))
     }));
 
+    // 🔥 Actualiza precio y activa producto
     await axios.put(
       `https://${shop}/admin/api/2024-01/products/${product.id}.json`,
       {
         product: {
           id: product.id,
-          title: translatedTitle,
-          body_html: translatedHtml,
           variants: updatedVariants,
           status: "active"
         }
@@ -169,6 +105,7 @@ app.post("/webhook/products-create", async (req, res) => {
       }
     );
 
+    // 🔥 Obtener location
     const locations = await axios.get(
       `https://${shop}/admin/api/2024-01/locations.json`,
       {
@@ -180,6 +117,7 @@ app.post("/webhook/products-create", async (req, res) => {
 
     const locationId = locations.data.locations[0].id;
 
+    // 🔥 Forzar inventario 11
     for (const variant of product.variants) {
       await axios.post(
         `https://${shop}/admin/api/2024-01/inventory_levels/set.json`,
@@ -196,7 +134,7 @@ app.post("/webhook/products-create", async (req, res) => {
       );
     }
 
-    console.log("Producto transformado correctamente");
+    console.log("Producto actualizado correctamente (sin traducción)");
 
   } catch (err) {
     console.error("Error webhook full:", err.response?.data || err.message);
