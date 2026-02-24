@@ -21,7 +21,7 @@ const MARGIN_1 = 1.15;
 const MARGIN_2 = 1.20;
 const FIXED_STOCK = 11;
 
-// 🔒 ESTABILIZADO: SIEMPRE 1 KG
+// Peso estable
 const DEFAULT_WEIGHT_VALUE = 1;
 const DEFAULT_WEIGHT_UNIT = "kg";
 
@@ -73,6 +73,10 @@ function detectCategory(title) {
   return "GENERAL";
 }
 
+/* ==========================
+   TRADUCCIÓN + SEO CONTROLADO
+========================== */
+
 async function translateText(text) {
   if (!text || !text.trim()) return text;
 
@@ -81,26 +85,39 @@ async function translateText(text) {
       "https://api.openai.com/v1/chat/completions",
       {
         model: "gpt-4o-mini",
+        temperature: 0.2,
         messages: [
-          { role: "system", content: "Traduce al español de México." },
+          {
+            role: "system",
+            content: `
+Traduce al español de México.
+Optimiza ligeramente para SEO sin exagerar.
+No agregues más de 1 palabra estratégica.
+No cambies el significado original.
+No uses adjetivos vacíos como "increíble", "mejor", "premium".
+Mantén máximo 65 caracteres si es posible.
+Devuelve solo el título final.
+`
+          },
           { role: "user", content: text }
-        ],
-        temperature: 0
+        ]
       },
       {
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`
+        }
       }
     );
 
-    return response.data.choices?.[0]?.message?.content ?? text;
+    return response.data.choices[0].message.content.trim();
   } catch (err) {
-    log("Traducción omitida", err.response?.data || err.message);
+    log("Traducción omitida:", err.response?.data || err.message);
     return text;
   }
 }
 
 async function translateHtmlPreservingTags(html) {
-  const $ = cheerio.load(html || "", { decodeEntities: false });
+  const $ = cheerio.load(html, { decodeEntities: false });
   const textNodes = [];
 
   function walk(node) {
@@ -126,7 +143,7 @@ async function getToken(shop) {
     "SELECT access_token FROM shop_tokens WHERE shop = $1",
     [shop]
   );
-  if (!result.rows.length) throw new Error(`Token not found for shop: ${shop}`);
+  if (!result.rows.length) throw new Error("Token not found");
   return result.rows[0].access_token;
 }
 
@@ -167,13 +184,11 @@ async function updateTrackingOnFulfillment(shop, accessToken, fulfillmentId, car
     }
   };
 
-  const resp = await axios.post(
+  await axios.post(
     `https://${shop}/admin/api/2026-01/fulfillments/${fulfillmentId}/update_tracking.json`,
     payload,
     { headers: { "X-Shopify-Access-Token": accessToken } }
   );
-
-  return resp.data;
 }
 
 /* ==========================
@@ -217,7 +232,9 @@ app.post("/webhook/products-create", async (req, res) => {
           status: "active"
         }
       },
-      { headers: { "X-Shopify-Access-Token": accessToken } }
+      {
+        headers: { "X-Shopify-Access-Token": accessToken }
+      }
     );
 
     for (const variant of realVariants) {
@@ -232,7 +249,9 @@ app.post("/webhook/products-create", async (req, res) => {
             weight_unit: DEFAULT_WEIGHT_UNIT
           }
         },
-        { headers: { "X-Shopify-Access-Token": accessToken } }
+        {
+          headers: { "X-Shopify-Access-Token": accessToken }
+        }
       );
     }
 
@@ -241,7 +260,7 @@ app.post("/webhook/products-create", async (req, res) => {
       { headers: { "X-Shopify-Access-Token": accessToken } }
     );
 
-    const locationId = locations.data?.locations?.[0]?.id;
+    const locationId = locations.data.locations[0].id;
 
     for (const variant of realVariants) {
       await axios.post(
@@ -251,13 +270,15 @@ app.post("/webhook/products-create", async (req, res) => {
           inventory_item_id: variant.inventory_item_id,
           available: FIXED_STOCK
         },
-        { headers: { "X-Shopify-Access-Token": accessToken } }
+        {
+          headers: { "X-Shopify-Access-Token": accessToken }
+        }
       );
     }
 
-    log("Producto transformado correctamente");
+    log("Producto transformado correctamente con SEO leve");
   } catch (err) {
-    console.error("Error webhook products-create:", err.response?.data || err.message);
+    console.error("Error webhook:", err.response?.data || err.message);
   }
 });
 
@@ -282,24 +303,18 @@ app.post("/webhook/fulfillment", async (req, res) => {
     const carrierSlug = detectAftershipCarrierSlug(trackingNumber, payload?.tracking_company);
     const trackingUrl = buildAftershipUrl(carrierSlug, trackingNumber);
 
-    let fulfillmentId = null;
-
     if (payload?.id && String(topic).startsWith("fulfillments/")) {
-      fulfillmentId = payload.id;
+      await updateTrackingOnFulfillment(
+        shop,
+        accessToken,
+        payload.id,
+        carrierSlug,
+        trackingNumber,
+        trackingUrl
+      );
     }
 
-    if (!fulfillmentId) return;
-
-    await updateTrackingOnFulfillment(
-      shop,
-      accessToken,
-      fulfillmentId,
-      carrierSlug,
-      trackingNumber,
-      trackingUrl
-    );
-
-    log("Tracking actualizado", { fulfillmentId, trackingUrl });
+    log("Tracking actualizado");
   } catch (err) {
     console.error("Error fulfillment webhook:", err.response?.data || err.message);
   }
