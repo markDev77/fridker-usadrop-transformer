@@ -21,9 +21,9 @@ const MARGIN_1 = 1.15;
 const MARGIN_2 = 1.20;
 const FIXED_STOCK = 11;
 
-// Peso: fuerza 1000 g para TODAS las variantes
-const DEFAULT_WEIGHT_VALUE = 1000;
-const DEFAULT_WEIGHT_UNIT = "g";
+// 🔒 ESTABILIZADO: SIEMPRE 1 KG
+const DEFAULT_WEIGHT_VALUE = 1;
+const DEFAULT_WEIGHT_UNIT = "kg";
 
 /* ==========================
    PostgreSQL
@@ -131,58 +131,23 @@ async function getToken(shop) {
 }
 
 function pickTrackingNumberFromPayload(payload) {
-  const tinfo = payload?.tracking_info;
-
-  // 1) tracking_info.number
-  if (tinfo?.number && String(tinfo.number).trim()) return String(tinfo.number).trim();
-
-  // 2) tracking_number
-  if (payload?.tracking_number && String(payload.tracking_number).trim())
-    return String(payload.tracking_number).trim();
-
-  // 3) tracking_numbers array
-  if (Array.isArray(payload?.tracking_numbers) && payload.tracking_numbers.length) {
-    const n = payload.tracking_numbers[0];
-    if (n && String(n).trim()) return String(n).trim();
-  }
-
-  // 4) trackingInfo.number
-  if (payload?.trackingInfo?.number && String(payload.trackingInfo.number).trim())
-    return String(payload.trackingInfo.number).trim();
-
+  if (payload?.tracking_info?.number) return String(payload.tracking_info.number).trim();
+  if (payload?.tracking_number) return String(payload.tracking_number).trim();
+  if (Array.isArray(payload?.tracking_numbers) && payload.tracking_numbers.length)
+    return String(payload.tracking_numbers[0]).trim();
   return null;
 }
 
-/**
- * REGLA: SIEMPRE AfterShip
- * Construye carrier_slug para AfterShip y una URL siempre.
- * Nota: AfterShip tiene cientos de carriers; aquí cubrimos los comunes + tu 360lion.
- * Si llega tracking_company, lo usamos para mapear.
- */
 function detectAftershipCarrierSlug(trackingNumber, trackingCompanyRaw) {
   const tn = String(trackingNumber || "").trim();
-  const tc = String(trackingCompanyRaw || "").trim().toLowerCase();
+  const tc = String(trackingCompanyRaw || "").toLowerCase();
 
-  // Preferimos tracking_company si viene
-  if (tc) {
-    if (tc.includes("360lion")) return "360lion";
-    if (tc.includes("ups")) return "ups";
-    if (tc.includes("fedex")) return "fedex";
-    if (tc.includes("dhl")) return "dhl";
-    if (tc.includes("estafeta")) return "estafeta";
-    if (tc.includes("redpack")) return "redpack";
-    if (tc.includes("paquetexpress") || tc.includes("paquet express")) return "paquetexpress";
-    if (tc.includes("99minutos") || tc.includes("99 minutos")) return "99minutos";
-    if (tc.includes("j&t") || tc.includes("j&t express") || tc.includes("jtexpress")) return "jtexpress";
-    if (tc.includes("correos") || tc.includes("mexico")) return "mexico-post";
-  }
+  if (tc.includes("360lion")) return "360lion";
+  if (tc.includes("ups") || tn.startsWith("1Z")) return "ups";
+  if (tc.includes("fedex")) return "fedex";
+  if (tc.includes("dhl")) return "dhl";
+  if (tn.startsWith("JM")) return "360lion";
 
-  // Heurísticas por patrón (no perfectas, pero prácticas)
-  if (tn.startsWith("JM")) return "360lion";     // tu caso
-  if (tn.startsWith("1Z")) return "ups";         // UPS
-  if (/^\d{12,15}$/.test(tn)) return "fedex";    // muchos FedEx son numéricos
-
-  // Fallback: custom (AfterShip lo abre pero puede pedir seleccionar carrier)
   return "custom";
 }
 
@@ -190,18 +155,7 @@ function buildAftershipUrl(carrierSlug, trackingNumber) {
   return `https://www.aftership.com/track/${carrierSlug}/${trackingNumber}`;
 }
 
-async function getFulfillmentIdsFromFulfillmentOrder(shop, accessToken, fulfillmentOrderId) {
-  const resp = await axios.get(
-    `https://${shop}/admin/api/2026-01/fulfillment_orders/${fulfillmentOrderId}/fulfillments.json`,
-    { headers: { "X-Shopify-Access-Token": accessToken } }
-  );
-
-  const fulfillments = resp.data?.fulfillments || [];
-  return fulfillments.map(f => f.id).filter(Boolean);
-}
-
 async function updateTrackingOnFulfillment(shop, accessToken, fulfillmentId, carrierSlug, trackingNumber, trackingUrl) {
-  // REST 2026-01: update_tracking.json
   const payload = {
     fulfillment: {
       notify_customer: false,
@@ -230,20 +184,12 @@ app.post("/webhook/products-create", async (req, res) => {
   res.status(200).send("ok");
 
   const shop = req.headers["x-shopify-shop-domain"];
-  const topic = req.headers["x-shopify-topic"];
   if (!shop) return;
-
-  log("products-create webhook received", {
-    shop,
-    topic,
-    product_id: req.body?.id
-  });
 
   try {
     const accessToken = await getToken(shop);
     const product = req.body;
 
-    // Espera a que Shopify termine de materializar variantes
     await new Promise(resolve => setTimeout(resolve, 1500));
 
     const freshProduct = await axios.get(
@@ -274,7 +220,6 @@ app.post("/webhook/products-create", async (req, res) => {
       { headers: { "X-Shopify-Access-Token": accessToken } }
     );
 
-    // Update de variantes: precio + SKU + peso 1000g
     for (const variant of realVariants) {
       await axios.put(
         `https://${shop}/admin/api/2024-01/variants/${variant.id}.json`,
@@ -297,7 +242,6 @@ app.post("/webhook/products-create", async (req, res) => {
     );
 
     const locationId = locations.data?.locations?.[0]?.id;
-    if (!locationId) throw new Error("No locations found to set inventory");
 
     for (const variant of realVariants) {
       await axios.post(
@@ -311,19 +255,14 @@ app.post("/webhook/products-create", async (req, res) => {
       );
     }
 
-    log("Producto transformado correctamente", {
-      product_id: product.id,
-      variants: realVariants.length,
-      weight: `${DEFAULT_WEIGHT_VALUE}${DEFAULT_WEIGHT_UNIT}`
-    });
+    log("Producto transformado correctamente");
   } catch (err) {
-    console.error("Error webhook products-create full:", err.response?.data || err.message);
+    console.error("Error webhook products-create:", err.response?.data || err.message);
   }
 });
 
 /* ==========================
-   WEBHOOK TRACKING (FULFILLMENT / FULFILLMENT ORDER)
-   REGLA: SIEMPRE AfterShip URL
+   WEBHOOK TRACKING
 ========================== */
 
 app.post("/webhook/fulfillment", async (req, res) => {
@@ -331,110 +270,38 @@ app.post("/webhook/fulfillment", async (req, res) => {
 
   const shop = req.headers["x-shopify-shop-domain"];
   const topic = req.headers["x-shopify-topic"];
-  const webhookId = req.headers["x-shopify-webhook-id"];
-
   if (!shop) return;
-
-  const payload = req.body || {};
-
-  log("fulfillment webhook received", {
-    shop,
-    topic,
-    webhookId,
-    payload_keys: Object.keys(payload || {}),
-    payload_id: payload?.id,
-    fulfillment_id: payload?.fulfillment_id,
-    fulfillment_order_id: payload?.fulfillment_order_id,
-    tracking_company: payload?.tracking_company
-  });
 
   try {
     const accessToken = await getToken(shop);
+    const payload = req.body || {};
 
     const trackingNumber = pickTrackingNumberFromPayload(payload);
+    if (!trackingNumber) return;
 
-    log("tracking detect", {
-      trackingNumber,
-      tracking_info: payload?.tracking_info,
-      tracking_number: payload?.tracking_number,
-      tracking_numbers: payload?.tracking_numbers,
-      tracking_company: payload?.tracking_company
-    });
-
-    if (!trackingNumber) {
-      log("skip: no tracking number found in payload", null);
-      return;
-    }
-
-    // REGLA: SIEMPRE construir AfterShip
     const carrierSlug = detectAftershipCarrierSlug(trackingNumber, payload?.tracking_company);
     const trackingUrl = buildAftershipUrl(carrierSlug, trackingNumber);
 
-    log("aftership build", { carrierSlug, trackingUrl });
+    let fulfillmentId = null;
 
-    // Determinar fulfillmentId correcto
-    let fulfillmentIds = [];
-
-    // Caso A: topic fulfillments/* => payload.id es fulfillment.id
-    if (payload?.id && typeof payload.id === "number" && String(topic || "").startsWith("fulfillments/")) {
-      fulfillmentIds = [payload.id];
-      log("mode A: topic fulfillments/* using payload.id", fulfillmentIds);
-    }
-    // Caso B: payload.fulfillment_id explícito
-    else if (payload?.fulfillment_id) {
-      fulfillmentIds = [payload.fulfillment_id];
-      log("mode B: using payload.fulfillment_id", fulfillmentIds);
-    }
-    // Caso C: topic fulfillment_orders/* => resolver fulfillments desde fulfillment_order_id
-    else if (
-      (payload?.fulfillment_order_id || payload?.id) &&
-      String(topic || "").startsWith("fulfillment_orders/")
-    ) {
-      const fulfillmentOrderId = payload.fulfillment_order_id || payload.id;
-      log("mode C: topic fulfillment_orders/* resolve fulfillments for FO", { fulfillmentOrderId });
-
-      fulfillmentIds = await getFulfillmentIdsFromFulfillmentOrder(shop, accessToken, fulfillmentOrderId);
-      log("resolved fulfillmentIds from fulfillment_order", fulfillmentIds);
-    }
-    // Caso D: no determinable
-    else {
-      log("mode D: cannot reliably determine fulfillment id", { topic, payload_id: payload?.id });
-      return;
+    if (payload?.id && String(topic).startsWith("fulfillments/")) {
+      fulfillmentId = payload.id;
     }
 
-    if (!fulfillmentIds.length) {
-      log("skip: no fulfillment ids resolved", null);
-      return;
-    }
+    if (!fulfillmentId) return;
 
-    // Update tracking en todos los fulfillments resueltos
-    for (const fid of fulfillmentIds) {
-      try {
-        const result = await updateTrackingOnFulfillment(
-          shop,
-          accessToken,
-          fid,
-          carrierSlug,
-          trackingNumber,
-          trackingUrl
-        );
+    await updateTrackingOnFulfillment(
+      shop,
+      accessToken,
+      fulfillmentId,
+      carrierSlug,
+      trackingNumber,
+      trackingUrl
+    );
 
-        log("Tracking actualizado (update_tracking.json)", {
-          fulfillmentId: fid,
-          carrierSlug,
-          trackingNumber,
-          trackingUrl,
-          result_keys: Object.keys(result || {})
-        });
-      } catch (e) {
-        console.error("Error updating tracking for fulfillment:", {
-          fulfillmentId: fid,
-          error: e.response?.data || e.message
-        });
-      }
-    }
+    log("Tracking actualizado", { fulfillmentId, trackingUrl });
   } catch (err) {
-    console.error("Error fulfillment handler:", err.response?.data || err.message);
+    console.error("Error fulfillment webhook:", err.response?.data || err.message);
   }
 });
 
