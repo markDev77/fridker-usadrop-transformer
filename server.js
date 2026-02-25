@@ -21,7 +21,7 @@ const USD_TO_MXN = 20;
 // Stock fijo
 const FIXED_STOCK = 11;
 
-// Peso estable
+// Peso estable (para Shopify)
 const DEFAULT_WEIGHT_VALUE = 1;
 const DEFAULT_WEIGHT_UNIT = "kg";
 
@@ -38,6 +38,50 @@ const BASE_BACKOFF_MS = 800;
 
 // Espera post-create para que Shopify termine de materializar variantes/inventory_item_id
 const PRODUCT_CREATE_WARMUP_MS = 1800;
+
+/* ==========================
+   ZEUS COMPLIANCE (paramétrico)
+   - Para Nelo/Elektra/etc.
+========================== */
+
+// Lista base (puedes ampliarla por ENV sin tocar código)
+const DEFAULT_BANNED_WORDS = [
+  "imitacion",
+  "imitación",
+  "replica",
+  "réplica",
+  "falsificado",
+  "copia",
+  "clon",
+
+  // ejemplos reales tuyos
+  "cerveza",
+  "granada",
+
+  // armas / filosos (por texto)
+  "arma",
+  "pistola",
+  "rifle",
+  "municion",
+  "munición",
+  "cuchillo",
+  "navaja"
+];
+
+// ENV opcional: ZEUS_BANNED_WORDS="palabra1,palabra2,palabra3"
+function getBannedWords() {
+  const extra = (process.env.ZEUS_BANNED_WORDS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const all = [...DEFAULT_BANNED_WORDS, ...extra];
+  return Array.from(new Set(all.map(w => w.toLowerCase())));
+}
+
+// Palabras “sensibles” de material: si detectamos PU/sintético, evitamos “cuero”
+const LEATHER_WORDS = ["cuero", "piel genuina", "piel real"];
+const LEATHER_REPLACEMENT = "piel sintética";
 
 /* ==========================
    PostgreSQL
@@ -272,6 +316,90 @@ async function translateHtmlPreservingTags(html) {
 }
 
 /* ==========================
+   ZEUS COMPLIANCE HELPERS
+========================== */
+
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeSpaces(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .trim();
+}
+
+// Detecta material “probable” desde body_html
+function detectMaterialHint(title, bodyHtml) {
+  const t = (title || "").toLowerCase();
+  const bodyText = cheerio.load(bodyHtml || "", { decodeEntities: false }).text().toLowerCase();
+
+  const hasPU =
+    bodyText.includes(" material: pu") ||
+    bodyText.includes("material: pu") ||
+    bodyText.includes("material:pu") ||
+    bodyText.includes("polyurethane") ||
+    bodyText.includes("poliuretano") ||
+    bodyText.includes("piel sintética") ||
+    bodyText.includes("sintético") ||
+    bodyText.includes("sintetico") ||
+    bodyText.includes(" pu ") ||
+    bodyText.includes(" pu,") ||
+    bodyText.includes(" pu.");
+
+  const saysLeather = t.includes("cuero") || bodyText.includes("cuero");
+
+  return { hasPU, saysLeather };
+}
+
+function sanitizeTextForMarketplace(text, materialHint) {
+  let s = String(text || "");
+
+  const bannedWords = getBannedWords();
+  for (const w of bannedWords) {
+    const re = new RegExp(`\\b${escapeRegExp(w)}\\b`, "gi");
+    s = s.replace(re, "");
+  }
+
+  if (materialHint?.hasPU) {
+    for (const w of LEATHER_WORDS) {
+      const re = new RegExp(`\\b${escapeRegExp(w)}\\b`, "gi");
+      s = s.replace(re, LEATHER_REPLACEMENT);
+    }
+  }
+
+  s = s.replace(/\(\s*\)/g, "");
+  s = s.replace(/\[\s*\]/g, "");
+  s = normalizeSpaces(s);
+
+  return s;
+}
+
+function sanitizeHtmlForMarketplace(html, materialHint) {
+  const $ = cheerio.load(html || "", { decodeEntities: false });
+
+  function walk(node) {
+    if (!node) return;
+    if (node.type === "text" && node.data && node.data.trim()) {
+      node.data = sanitizeTextForMarketplace(node.data, materialHint);
+    }
+    if (node.children) node.children.forEach(walk);
+  }
+
+  walk($.root()[0]);
+  return $.root().html();
+}
+
+function ensureNonEmptyTitle(title, fallback) {
+  const t = normalizeSpaces(title);
+  if (t && t.length >= 3) return t;
+  const fb = normalizeSpaces(fallback);
+  if (fb && fb.length >= 3) return fb;
+  return "Producto importado";
+}
+
+/* ==========================
    TOKENS
 ========================== */
 
@@ -331,6 +459,68 @@ async function updateTrackingOnFulfillment(shop, accessToken, fulfillmentId, car
 }
 
 /* ==========================
+   GRAPHQL HELPERS (para reconcile por SKU)
+========================== */
+
+function gidToNumericId(gid) {
+  if (!gid) return null;
+  const m = String(gid).match(/\/(\d+)\s*$/);
+  return m ? Number(m[1]) : null;
+}
+
+async function shopifyGraphQL(shop, accessToken, query, variables) {
+  return shopifyRequest(shop, {
+    method: "POST",
+    url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/graphql.json`,
+    headers: {
+      "X-Shopify-Access-Token": accessToken,
+      "Content-Type": "application/json"
+    },
+    data: { query, variables }
+  });
+}
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function findProductIdsBySkus(shop, accessToken, skus) {
+  const uniq = Array.from(new Set((skus || []).map(s => String(s || "").trim()).filter(Boolean)));
+  if (uniq.length === 0) return [];
+
+  const productIds = new Set();
+  const batches = chunk(uniq, 10);
+
+  const GQL = `
+    query($q: String!) {
+      productVariants(first: 50, query: $q) {
+        edges {
+          node {
+            sku
+            product { id }
+          }
+        }
+      }
+    }
+  `;
+
+  for (const batch of batches) {
+    const q = batch.map(s => `sku:${s.replace(/"/g, "")}`).join(" OR ");
+    const resp = await shopifyGraphQL(shop, accessToken, GQL, { q });
+
+    const edges = resp?.data?.data?.productVariants?.edges || [];
+    for (const e of edges) {
+      const pid = gidToNumericId(e?.node?.product?.id);
+      if (pid) productIds.add(pid);
+    }
+  }
+
+  return Array.from(productIds);
+}
+
+/* ==========================
    CORE: TRANSFORM PRODUCT
 ========================== */
 
@@ -346,9 +536,22 @@ async function transformProductById(shop, accessToken, productId) {
   const realProduct = freshProduct.data.product;
   const realVariants = realProduct.variants || [];
 
-  const translatedTitle = await translateText(realProduct.title);
-  const translatedHtml = await translateHtmlPreservingTags(realProduct.body_html);
-  const detectedCat = detectCategory(realProduct.title);
+  // Hint de material (antes de traducir)
+  const materialHint = detectMaterialHint(realProduct.title, realProduct.body_html);
+
+  // Traducción
+  const translatedTitleRaw = await translateText(realProduct.title);
+  let translatedHtml = await translateHtmlPreservingTags(realProduct.body_html);
+
+  // Compliance (aplica a todos)
+  const titleBefore = translatedTitleRaw;
+  let translatedTitle = sanitizeTextForMarketplace(translatedTitleRaw, materialHint);
+  translatedHtml = sanitizeHtmlForMarketplace(translatedHtml, materialHint);
+
+  // Anti-"Default Title"/vacío
+  translatedTitle = ensureNonEmptyTitle(translatedTitle, titleBefore);
+
+  const detectedCat = detectCategory(translatedTitle);
 
   // Update producto
   await shopifyRequest(shop, {
@@ -413,10 +616,12 @@ async function transformProductById(shop, accessToken, productId) {
     });
   }
 
-  log("Producto transformado correctamente (SEO leve + pricing)", {
+  log("Producto transformado (SEO + pricing + compliance)", {
     shop,
     productId,
-    variants: realVariants.length
+    variants: realVariants.length,
+    hasPU: materialHint.hasPU,
+    bannedWordsCount: getBannedWords().length
   });
 }
 
@@ -468,7 +673,7 @@ app.post("/webhook/fulfillment", async (req, res) => {
 });
 
 /* ==========================
-   RECONCILIACIÓN (manual)
+   RECONCILIACIÓN (manual por product_ids)
 ========================== */
 
 app.post("/reconcile", async (req, res) => {
@@ -496,6 +701,41 @@ app.post("/reconcile", async (req, res) => {
 });
 
 /* ==========================
+   RECONCILIACIÓN (por SKUs - para CSV de Nelo)
+========================== */
+
+app.post("/reconcile-by-skus", async (req, res) => {
+  try {
+    const { shop, skus } = req.body || {};
+    if (!shop || !Array.isArray(skus) || skus.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Body requerido: { shop: 'xxx.myshopify.com', skus: ['SKU1','SKU2'] }"
+      });
+    }
+
+    const accessToken = await getToken(shop);
+    const productIds = await findProductIdsBySkus(shop, accessToken, skus);
+
+    if (productIds.length === 0) {
+      return res.json({ ok: true, queued: 0, note: "No se encontraron productos en Shopify para esos SKUs" });
+    }
+
+    productIds.forEach(pid => {
+      enqueueShopJob(shop, "reconcile-by-skus", async () => {
+        const token = await getToken(shop);
+        await transformProductById(shop, token, pid);
+      });
+    });
+
+    return res.json({ ok: true, queued: productIds.length, product_ids: productIds });
+  } catch (err) {
+    console.error("reconcile-by-skus error:", err.response?.data || err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ==========================
    HEALTH
 ========================== */
 
@@ -504,7 +744,13 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, time: nowIso(), shopsInMemory: shopQueues.size });
+  res.json({
+    ok: true,
+    time: nowIso(),
+    shopsInMemory: shopQueues.size,
+    bannedWordsCount: getBannedWords().length,
+    version: "zeus-transformer-v1.0-compliance"
+  });
 });
 
 app.listen(PORT, async () => {
