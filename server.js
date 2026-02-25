@@ -240,7 +240,7 @@ function calculatePrice(usdRaw) {
   mxn += 350;
 
   // Margen defensivo
-  mxn *= 1.16;
+  mxn *= 1.14;
 
   return Math.ceil(mxn);
 }
