@@ -220,22 +220,26 @@ function calculatePrice(usdRaw) {
   const usd = Number(usdRaw);
   let adjustedUsd = Number.isFinite(usd) ? usd : 0;
 
-  // Ajuste proveedor equilibrado (promedio del rango observado)
-  if (adjustedUsd <= 20) {
-    adjustedUsd += 25;
+  // MODELO DEFENSIVO v2 (Nelo)
+
+  if (adjustedUsd <= 8) {
+    // Micro productos
+    adjustedUsd = adjustedUsd * 2.1;
+  } else if (adjustedUsd <= 20) {
+    adjustedUsd += 18;
   } else if (adjustedUsd <= 30) {
-    adjustedUsd += 30;
+    adjustedUsd += 25;
   } else {
-    adjustedUsd += 42;
+    adjustedUsd += 38;
   }
 
   // Conversión
   let mxn = adjustedUsd * USD_TO_MXN;
 
-  // Fee operativo equilibrado
+  // Fee operativo Nelo
   mxn += 350;
 
-  // Margen comercial equilibrado
+  // Margen defensivo
   mxn *= 1.22;
 
   return Math.ceil(mxn);
