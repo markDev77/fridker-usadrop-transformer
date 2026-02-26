@@ -70,6 +70,66 @@ const LEATHER_WORDS = ["cuero", "piel genuina", "piel real"];
 const LEATHER_REPLACEMENT = "piel sintética";
 
 /* ==========================
+   MARKETPLACE BLOCK LIST (NUEVO)
+========================== */
+
+const MARKETPLACE_BLOCK_WORDS = [
+  "defensa",
+  "autodefensa",
+  "arma",
+  "espiga",
+  "punta",
+  "cuchillo",
+  "navaja",
+  "táctico",
+  "tactico",
+  "self defense",
+  "self-defense"
+];
+
+function isBlockedProduct(title, bodyHtml) {
+  const t = String(title || "").toLowerCase();
+  const b = cheerio.load(bodyHtml || "", { decodeEntities: false }).text().toLowerCase();
+  return MARKETPLACE_BLOCK_WORDS.some(word => t.includes(word) || b.includes(word));
+}
+
+/* ==========================
+   IMAGE FALLBACK FROM HTML (NUEVO)
+========================== */
+
+function extractFirstImageFromHtml(html) {
+  const $ = cheerio.load(html || "", { decodeEntities: false });
+  const img = $("img").first();
+  const src = img.attr("src");
+  if (!src) return null;
+
+  const s = String(src).trim();
+  if (!s) return null;
+  if (s.startsWith("data:")) return null; // evita base64
+  return s;
+}
+
+async function ensureMainImage(shop, accessToken, productId, realProduct) {
+  // Si ya tiene imágenes, no hacer nada
+  if (Array.isArray(realProduct?.images) && realProduct.images.length > 0) return;
+
+  const fallbackImage = extractFirstImageFromHtml(realProduct?.body_html);
+  if (!fallbackImage) {
+    log("No fallback image found", { shop, productId });
+    return;
+  }
+
+  await shopifyRequest(shop, {
+    method: "POST",
+    url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}/images.json`,
+    headers: { "X-Shopify-Access-Token": accessToken },
+    data: { image: { src: fallbackImage } }
+  });
+
+  log("Fallback image applied", { shop, productId, fallbackImage });
+}
+
+/* ==========================
    POSTGRES
 ========================== */
 
@@ -526,6 +586,29 @@ async function transformProductById(shop, accessToken, productId) {
   });
 
   const realProduct = freshProduct.data.product;
+
+  // 🔴 BLOQUEO ESTRUCTURAL (ANTES DE TODO)
+  if (isBlockedProduct(realProduct.title, realProduct.body_html)) {
+    await shopifyRequest(shop, {
+      method: "PUT",
+      url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+      headers: { "X-Shopify-Access-Token": accessToken },
+      data: {
+        product: {
+          id: productId,
+          status: "draft",
+          tags: "BLOCKED_BY_POLICY"
+        }
+      }
+    });
+
+    log("Producto bloqueado por política marketplace", { shop, productId, title: realProduct.title });
+    return;
+  }
+
+  // 🔴 ASEGURAR IMAGEN PRINCIPAL (SI NO TRAE)
+  await ensureMainImage(shop, accessToken, productId, realProduct);
+
   const realVariants = realProduct.variants || [];
 
   const materialHint = detectMaterialHint(realProduct.title, realProduct.body_html);
@@ -778,7 +861,7 @@ app.get("/health", (req, res) => {
     time: nowIso(),
     shopsInMemory: shopQueues.size,
     bannedWordsCount: getBannedWords().length,
-    version: "zeus-transformer-v1.1-full+clean"
+    version: "zeus-transformer-v1.2-full+clean+block+image"
   });
 });
 
