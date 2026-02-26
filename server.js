@@ -101,51 +101,6 @@ const MARKETPLACE_BLOCK_WORDS = [
   "gun",
   "firearm"
 ];
-/* ==========================
-   MARKETPLACE SAFE EXTENDED
-   (Marcas, Claims, Compatibilidad, Emojis)
-========================== */
-
-// ⚠️ Marcas conocidas (puedes ampliar vía ENV si quieres)
-const TRADEMARK_WORDS = [
-  "apple",
-  "iphone",
-  "ipad",
-  "macbook",
-  "samsung",
-  "xiaomi",
-  "huawei",
-  "sony",
-  "nike",
-  "adidas",
-  "puma",
-  "lg",
-  "motorola",
-  "lenovo",
-  "hp",
-  "dell"
-];
-
-// ⚠️ Claims prohibidos
-const CLAIM_WORDS = [
-  "100% original",
-  "original",
-  "auténtico",
-  "autentico",
-  "garantizado",
-  "premium",
-  "alta calidad",
-  "mejor calidad"
-];
-
-// ⚠️ Compatibilidad directa tipo “para iPhone 14”
-const COMPATIBILITY_REGEX = /\b(para|compatible con)\s+[a-z0-9\s\-\.]+/gi;
-
-// ⚠️ Símbolos legales
-const LEGAL_SYMBOL_REGEX = /[®™©]/g;
-
-// ⚠️ Emojis
-const EMOJI_REGEX = /([\u2700-\u27BF]|[\uE000-\uF8FF]|[\uD83C-\uDBFF\uDC00-\uDFFF]+)/g;
 
 function isBlockedProduct(title, bodyHtml) {
   const t = String(title || "").toLowerCase();
@@ -498,52 +453,8 @@ function sanitizeTextForMarketplace(text, materialHint) {
   return s;
 }
 
-function sanitizeTextForMarketplace(text, materialHint) {
-  let s = String(text || "");
-
-  // 1️⃣ Remover palabras prohibidas base
-  const bannedWords = getBannedWords();
-  for (const w of bannedWords) {
-    const re = new RegExp(`\\b${escapeRegExp(w)}\\b`, "gi");
-    s = s.replace(re, "");
-  }
-
-  // 2️⃣ Remover marcas registradas
-  for (const w of TRADEMARK_WORDS) {
-    const re = new RegExp(`\\b${escapeRegExp(w)}\\b`, "gi");
-    s = s.replace(re, "");
-  }
-
-  // 3️⃣ Remover claims
-  for (const w of CLAIM_WORDS) {
-    const re = new RegExp(`\\b${escapeRegExp(w)}\\b`, "gi");
-    s = s.replace(re, "");
-  }
-
-  // 4️⃣ Remover compatibilidad directa
-  s = s.replace(COMPATIBILITY_REGEX, "");
-
-  // 5️⃣ Remover símbolos legales
-  s = s.replace(LEGAL_SYMBOL_REGEX, "");
-
-  // 6️⃣ Remover emojis
-  s = s.replace(EMOJI_REGEX, "");
-
-  // 7️⃣ Reemplazo cuero si aplica
-  if (materialHint?.hasPU) {
-    for (const w of LEATHER_WORDS) {
-      const re = new RegExp(`\\b${escapeRegExp(w)}\\b`, "gi");
-      s = s.replace(re, LEATHER_REPLACEMENT);
-    }
-  }
-
-  // Limpieza final
-  s = s.replace(/\(\s*\)/g, "");
-  s = s.replace(/\[\s*\]/g, "");
-  s = normalizeSpaces(s);
-
-  return s;
-}
+function sanitizeHtmlForMarketplace(html, materialHint) {
+  const $ = cheerio.load(html || "", { decodeEntities: false });
 
   function walk(node) {
     if (!node) return;
@@ -1196,3 +1107,4 @@ app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   await initDB();
 });
+
