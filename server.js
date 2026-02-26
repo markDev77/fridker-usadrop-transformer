@@ -222,7 +222,7 @@ function calculatePrice(usdRaw) {
 
   // MICRO PRODUCTOS
   if (adjustedUsd <= 8) {
-    adjustedUsd = adjustedUsd * 2.2;
+    adjustedUsd = adjustedUsd * 2.1;
   }
 
   // BAJO
