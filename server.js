@@ -220,31 +220,45 @@ function calculatePrice(usdRaw) {
   const usd = Number(usdRaw);
   let adjustedUsd = Number.isFinite(usd) ? usd : 0;
 
-  // MODELO DEFENSIVO v2 (Nelo)
-
+  // MICRO PRODUCTOS
   if (adjustedUsd <= 8) {
-    // Micro productos
-    adjustedUsd = adjustedUsd * 2.1;
-  } else if (adjustedUsd <= 20) {
-    adjustedUsd += 18;
-  } else if (adjustedUsd <= 30) {
-    adjustedUsd += 25;
-  } else {
-    adjustedUsd += 38;
+    adjustedUsd = adjustedUsd * 2.2;
+  }
+
+  // BAJO
+  else if (adjustedUsd <= 20) {
+    adjustedUsd = adjustedUsd * 1.9;
+  }
+
+  // MEDIO
+  else if (adjustedUsd <= 40) {
+    adjustedUsd = adjustedUsd * 1.75;
+  }
+
+  // ALTO
+  else if (adjustedUsd <= 80) {
+    adjustedUsd = adjustedUsd * 1.65;
+  }
+
+  // GRANDE / VOLUMEN
+  else {
+    adjustedUsd = adjustedUsd * 1.55;
   }
 
   // Conversión
   let mxn = adjustedUsd * USD_TO_MXN;
 
-  // Fee operativo Nelo
+  // Fee operativo fijo Nelo
   mxn += 350;
 
-  // Margen defensivo
-  mxn *= 1.14;
+  // Blindaje marketplace
+  mxn *= 1.16;
 
-  return Math.ceil(mxn);
+  // Psicología retail
+  mxn = Math.ceil(mxn / 10) * 10 - 1;
+
+  return Math.max(99, mxn);
 }
-
 /* ==========================
    CATEGORÍA SIMPLE
 ========================== */
