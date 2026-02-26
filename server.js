@@ -8,43 +8,35 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 10000;
-
 const { DATABASE_URL, OPENAI_API_KEY } = process.env;
 
 /* ==========================
    CONFIG NEGOCIO
 ========================== */
 
-// Tipo de cambio operativo
 const USD_TO_MXN = 20;
-
-// Stock fijo
 const FIXED_STOCK = 11;
 
-// Peso estable (para Shopify)
 const DEFAULT_WEIGHT_VALUE = 1;
 const DEFAULT_WEIGHT_UNIT = "kg";
 
-// Shopify API versions
 const PRODUCT_API_VERSION = "2024-01";
 const FULFILLMENT_API_VERSION = "2026-01";
 
-// Rate limit control (Shopify 2rps aprox por app/tienda; 650ms es seguro)
+// Shopify rate limit safety
 const SHOPIFY_MIN_INTERVAL_MS = 650;
 
 // Retry control
 const MAX_RETRIES = 6;
 const BASE_BACKOFF_MS = 800;
 
-// Espera post-create para que Shopify termine de materializar variantes/inventory_item_id
+// Espera post-create para que Shopify materialice variantes/inventory_item_id
 const PRODUCT_CREATE_WARMUP_MS = 1800;
 
 /* ==========================
    ZEUS COMPLIANCE (paramétrico)
-   - Para Nelo/Elektra/etc.
 ========================== */
 
-// Lista base (puedes ampliarla por ENV sin tocar código)
 const DEFAULT_BANNED_WORDS = [
   "imitacion",
   "imitación",
@@ -53,12 +45,8 @@ const DEFAULT_BANNED_WORDS = [
   "falsificado",
   "copia",
   "clon",
-
-  // ejemplos reales tuyos
   "cerveza",
   "granada",
-
-  // armas / filosos (por texto)
   "arma",
   "pistola",
   "rifle",
@@ -68,7 +56,6 @@ const DEFAULT_BANNED_WORDS = [
   "navaja"
 ];
 
-// ENV opcional: ZEUS_BANNED_WORDS="palabra1,palabra2,palabra3"
 function getBannedWords() {
   const extra = (process.env.ZEUS_BANNED_WORDS || "")
     .split(",")
@@ -79,12 +66,11 @@ function getBannedWords() {
   return Array.from(new Set(all.map(w => w.toLowerCase())));
 }
 
-// Palabras “sensibles” de material: si detectamos PU/sintético, evitamos “cuero”
 const LEATHER_WORDS = ["cuero", "piel genuina", "piel real"];
 const LEATHER_REPLACEMENT = "piel sintética";
 
 /* ==========================
-   PostgreSQL
+   POSTGRES
 ========================== */
 
 const pool = new Pool({
@@ -149,7 +135,12 @@ async function processShopQueue(shop) {
   try {
     while (q.queue.length > 0) {
       const item = q.queue.shift();
-      log("QUEUE: start", { shop, jobName: item.jobName, jobId: item.jobId, remaining: q.queue.length });
+      log("QUEUE: start", {
+        shop,
+        jobName: item.jobName,
+        jobId: item.jobId,
+        remaining: q.queue.length
+      });
 
       try {
         await item.fn();
@@ -204,7 +195,7 @@ async function shopifyRequest(shop, config, attempt = 0) {
     if (!retriable || attempt >= MAX_RETRIES) throw err;
 
     const retryAfter = getRetryAfterMs(err);
-    const backoff = retryAfter ?? (BASE_BACKOFF_MS * Math.pow(2, attempt));
+    const backoff = retryAfter ?? BASE_BACKOFF_MS * Math.pow(2, attempt);
     log("Shopify retry", { shop, status, attempt: attempt + 1, wait_ms: backoff });
 
     await sleep(backoff);
@@ -213,61 +204,47 @@ async function shopifyRequest(shop, config, attempt = 0) {
 }
 
 /* ==========================
-   PRICING - BLINDAJE MEDIO (equilibrado)
+   TOKENS
+========================== */
+
+async function getToken(shop) {
+  const result = await pool.query("SELECT access_token FROM shop_tokens WHERE shop = $1", [shop]);
+  if (!result.rows.length) throw new Error("Token not found");
+  return result.rows[0].access_token;
+}
+
+/* ==========================
+   PRICING - BLINDAJE MEDIO
+   + regla 699 (solo rangos indicados)
 ========================== */
 
 function calculatePrice(usdRaw) {
   const usd = Number(usdRaw);
   let adjustedUsd = Number.isFinite(usd) ? usd : 0;
 
-  // MICRO PRODUCTOS
-  if (adjustedUsd <= 8) {
-    adjustedUsd = adjustedUsd * 2.1;
-  }
+  // Multiplicadores por tramo
+  if (adjustedUsd <= 8) adjustedUsd *= 2.1;
+  else if (adjustedUsd <= 20) adjustedUsd *= 1.9;
+  else if (adjustedUsd <= 40) adjustedUsd *= 1.75;
+  else if (adjustedUsd <= 80) adjustedUsd *= 1.65;
+  else adjustedUsd *= 1.55;
 
-  // BAJO
-  else if (adjustedUsd <= 20) {
-    adjustedUsd = adjustedUsd * 1.9;
-  }
-
-  // MEDIO
-  else if (adjustedUsd <= 40) {
-    adjustedUsd = adjustedUsd * 1.75;
-  }
-
-  // ALTO
-  else if (adjustedUsd <= 80) {
-    adjustedUsd = adjustedUsd * 1.65;
-  }
-
-  // GRANDE / VOLUMEN
-  else {
-    adjustedUsd = adjustedUsd * 1.55;
-  }
-
-  // Conversión
+  // Conversión + fee + blindaje
   let mxn = adjustedUsd * USD_TO_MXN;
-
-  // Fee operativo fijo Nelo
   mxn += 350;
-
-  // Blindaje marketplace
   mxn *= 1.16;
 
-  /* ==========================
-     ANCLAJE PSICOLÓGICO ESPECÍFICO
-     300–600  → 699
-     700–740  → 699
-  ========================== */
+  // Psicología retail estándar (terminación 9)
+  mxn = Math.ceil(mxn / 10) * 10 - 1;
 
+  // Regla especial (solo estos rangos)
   if ((mxn >= 300 && mxn <= 600) || (mxn >= 700 && mxn <= 740)) {
     mxn = 699;
-  } else {
-    mxn = Math.ceil(mxn / 10) * 10 - 1;
   }
 
   return Math.max(99, mxn);
 }
+
 /* ==========================
    CATEGORÍA SIMPLE
 ========================== */
@@ -277,12 +254,12 @@ function detectCategory(title) {
   if (t.includes("bag") || t.includes("bolsa")) return "BOLSOS";
   if (t.includes("massage") || t.includes("masaje")) return "TERAPIA";
   if (t.includes("led")) return "ILUMINACION";
-  if (t.includes("chair")) return "HOGAR";
+  if (t.includes("chair") || t.includes("silla")) return "HOGAR";
   return "GENERAL";
 }
 
 /* ==========================
-   TRADUCCIÓN + SEO CONTROLADO
+   TRADUCCIÓN + HTML PRESERVANDO TAGS
 ========================== */
 
 async function translateText(text) {
@@ -343,7 +320,7 @@ async function translateHtmlPreservingTags(html) {
 }
 
 /* ==========================
-   ZEUS COMPLIANCE HELPERS
+   COMPLIANCE HELPERS
 ========================== */
 
 function escapeRegExp(str) {
@@ -357,9 +334,7 @@ function normalizeSpaces(s) {
     .trim();
 }
 
-// Detecta material “probable” desde body_html
 function detectMaterialHint(title, bodyHtml) {
-  const t = (title || "").toLowerCase();
   const bodyText = cheerio.load(bodyHtml || "", { decodeEntities: false }).text().toLowerCase();
 
   const hasPU =
@@ -375,8 +350,7 @@ function detectMaterialHint(title, bodyHtml) {
     bodyText.includes(" pu,") ||
     bodyText.includes(" pu.");
 
-  const saysLeather = t.includes("cuero") || bodyText.includes("cuero");
-
+  const saysLeather = String(title || "").toLowerCase().includes("cuero") || bodyText.includes("cuero");
   return { hasPU, saysLeather };
 }
 
@@ -424,16 +398,6 @@ function ensureNonEmptyTitle(title, fallback) {
   const fb = normalizeSpaces(fallback);
   if (fb && fb.length >= 3) return fb;
   return "Producto importado";
-}
-
-/* ==========================
-   TOKENS
-========================== */
-
-async function getToken(shop) {
-  const result = await pool.query("SELECT access_token FROM shop_tokens WHERE shop = $1", [shop]);
-  if (!result.rows.length) throw new Error("Token not found");
-  return result.rows[0].access_token;
 }
 
 /* ==========================
@@ -486,7 +450,7 @@ async function updateTrackingOnFulfillment(shop, accessToken, fulfillmentId, car
 }
 
 /* ==========================
-   GRAPHQL HELPERS (para reconcile por SKU)
+   GRAPHQL HELPERS (SKUs -> product_ids)
 ========================== */
 
 function gidToNumericId(gid) {
@@ -548,7 +512,8 @@ async function findProductIdsBySkus(shop, accessToken, skus) {
 }
 
 /* ==========================
-   CORE: TRANSFORM PRODUCT
+   FULL MODE: PRODUCT TRANSFORM
+   (pricing + peso + stock + vendor/tags + compliance)
 ========================== */
 
 async function transformProductById(shop, accessToken, productId) {
@@ -563,24 +528,19 @@ async function transformProductById(shop, accessToken, productId) {
   const realProduct = freshProduct.data.product;
   const realVariants = realProduct.variants || [];
 
-  // Hint de material (antes de traducir)
   const materialHint = detectMaterialHint(realProduct.title, realProduct.body_html);
 
-  // Traducción
   const translatedTitleRaw = await translateText(realProduct.title);
   let translatedHtml = await translateHtmlPreservingTags(realProduct.body_html);
 
-  // Compliance (aplica a todos)
   const titleBefore = translatedTitleRaw;
   let translatedTitle = sanitizeTextForMarketplace(translatedTitleRaw, materialHint);
   translatedHtml = sanitizeHtmlForMarketplace(translatedHtml, materialHint);
 
-  // Anti-"Default Title"/vacío
   translatedTitle = ensureNonEmptyTitle(translatedTitle, titleBefore);
 
   const detectedCat = detectCategory(translatedTitle);
 
-  // Update producto
   await shopifyRequest(shop, {
     method: "PUT",
     url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
@@ -598,7 +558,7 @@ async function transformProductById(shop, accessToken, productId) {
     }
   });
 
-  // Update variantes (precio + peso)
+  // Variantes: pricing + peso
   for (const variant of realVariants) {
     const usd = parseFloat(variant.price);
     const mxnPrice = calculatePrice(Number.isFinite(usd) ? usd : 0);
@@ -619,7 +579,7 @@ async function transformProductById(shop, accessToken, productId) {
     });
   }
 
-  // Location
+  // Inventory fixed stock
   const locations = await shopifyRequest(shop, {
     method: "GET",
     url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/locations.json`,
@@ -629,7 +589,6 @@ async function transformProductById(shop, accessToken, productId) {
   const locationId = locations.data?.locations?.[0]?.id;
   if (!locationId) throw new Error("No locations found to set inventory");
 
-  // Inventory set
   for (const variant of realVariants) {
     await shopifyRequest(shop, {
       method: "POST",
@@ -643,17 +602,58 @@ async function transformProductById(shop, accessToken, productId) {
     });
   }
 
-  log("Producto transformado (SEO + pricing + compliance)", {
+  log("Producto transformado (FULL)", {
     shop,
     productId,
     variants: realVariants.length,
-    hasPU: materialHint.hasPU,
     bannedWordsCount: getBannedWords().length
   });
 }
 
 /* ==========================
-   WEBHOOK: PRODUCTS CREATE
+   CLEAN ONLY (rechazos Nelo)
+   SOLO title + body_html
+   NO toca pricing/peso/stock
+========================== */
+
+async function cleanProductById(shop, accessToken, productId) {
+  const freshProduct = await shopifyRequest(shop, {
+    method: "GET",
+    url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+    headers: { "X-Shopify-Access-Token": accessToken }
+  });
+
+  const realProduct = freshProduct.data.product;
+
+  const materialHint = detectMaterialHint(realProduct.title, realProduct.body_html);
+
+  const translatedTitleRaw = await translateText(realProduct.title);
+  let translatedHtml = await translateHtmlPreservingTags(realProduct.body_html);
+
+  const titleBefore = translatedTitleRaw;
+  let translatedTitle = sanitizeTextForMarketplace(translatedTitleRaw, materialHint);
+  translatedHtml = sanitizeHtmlForMarketplace(translatedHtml, materialHint);
+
+  translatedTitle = ensureNonEmptyTitle(translatedTitle, titleBefore);
+
+  await shopifyRequest(shop, {
+    method: "PUT",
+    url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+    headers: { "X-Shopify-Access-Token": accessToken },
+    data: {
+      product: {
+        id: productId,
+        title: translatedTitle,
+        body_html: translatedHtml
+      }
+    }
+  });
+
+  log("Producto limpiado (CLEAN ONLY)", { shop, productId });
+}
+
+/* ==========================
+   WEBHOOK: PRODUCTS CREATE (FULL)
 ========================== */
 
 app.post("/webhook/products-create", async (req, res) => {
@@ -665,7 +665,7 @@ app.post("/webhook/products-create", async (req, res) => {
   const productId = req.body?.id;
   if (!productId) return;
 
-  enqueueShopJob(shop, "products-create", async () => {
+  enqueueShopJob(shop, "products-create(FULL)", async () => {
     const accessToken = await getToken(shop);
     await transformProductById(shop, accessToken, productId);
   });
@@ -700,7 +700,8 @@ app.post("/webhook/fulfillment", async (req, res) => {
 });
 
 /* ==========================
-   RECONCILIACIÓN (manual por product_ids)
+   RECONCILE (manual por product_ids) - CLEAN ONLY
+   Body: { shop, product_ids:[...] }
 ========================== */
 
 app.post("/reconcile", async (req, res) => {
@@ -714,9 +715,9 @@ app.post("/reconcile", async (req, res) => {
     }
 
     product_ids.forEach(pid => {
-      enqueueShopJob(shop, "reconcile-product", async () => {
+      enqueueShopJob(shop, "reconcile(CLEAN)", async () => {
         const accessToken = await getToken(shop);
-        await transformProductById(shop, accessToken, pid);
+        await cleanProductById(shop, accessToken, pid);
       });
     });
 
@@ -728,7 +729,8 @@ app.post("/reconcile", async (req, res) => {
 });
 
 /* ==========================
-   RECONCILIACIÓN (por SKUs - para CSV de Nelo)
+   RECONCILE BY SKUS - CLEAN ONLY
+   Body: { shop, skus:[...] }
 ========================== */
 
 app.post("/reconcile-by-skus", async (req, res) => {
@@ -749,9 +751,9 @@ app.post("/reconcile-by-skus", async (req, res) => {
     }
 
     productIds.forEach(pid => {
-      enqueueShopJob(shop, "reconcile-by-skus", async () => {
+      enqueueShopJob(shop, "reconcile-by-skus(CLEAN)", async () => {
         const token = await getToken(shop);
-        await transformProductById(shop, token, pid);
+        await cleanProductById(shop, token, pid);
       });
     });
 
@@ -776,7 +778,7 @@ app.get("/health", (req, res) => {
     time: nowIso(),
     shopsInMemory: shopQueues.size,
     bannedWordsCount: getBannedWords().length,
-    version: "zeus-transformer-v1.0-compliance"
+    version: "zeus-transformer-v1.1-full+clean"
   });
 });
 
