@@ -70,31 +70,48 @@ const LEATHER_WORDS = ["cuero", "piel genuina", "piel real"];
 const LEATHER_REPLACEMENT = "piel sintética";
 
 /* ==========================
-   MARKETPLACE BLOCK LIST (NUEVO)
+   MARKETPLACE BLOCK LIST (STRUCTURAL)
 ========================== */
 
 const MARKETPLACE_BLOCK_WORDS = [
+  // armas / punzocortantes / autodefensa
   "defensa",
   "autodefensa",
+  "self defense",
+  "self-defense",
   "arma",
-  "espiga",
-  "punta",
+  "weapon",
+  "knife",
   "cuchillo",
   "navaja",
+  "dagger",
+  "espiga",
+  "punta",
   "táctico",
   "tactico",
-  "self defense",
-  "self-defense"
+  // municiones / explosivos
+  "municion",
+  "munición",
+  "ammunition",
+  "granada",
+  "explosivo",
+  // pistolas / rifles
+  "pistola",
+  "rifle",
+  "gun",
+  "firearm"
 ];
 
 function isBlockedProduct(title, bodyHtml) {
   const t = String(title || "").toLowerCase();
   const b = cheerio.load(bodyHtml || "", { decodeEntities: false }).text().toLowerCase();
-  return MARKETPLACE_BLOCK_WORDS.some(word => t.includes(word) || b.includes(word));
+  return MARKETPLACE_BLOCK_WORDS.some(w => t.includes(w) || b.includes(w));
 }
 
 /* ==========================
-   IMAGE FALLBACK FROM HTML (NUEVO)
+   IMAGE FALLBACK FROM HTML
+   Si no hay imagen principal (product.images vacío),
+   toma la primera <img src="..."> del body_html y la sube como imagen del producto
 ========================== */
 
 function extractFirstImageFromHtml(html) {
@@ -110,7 +127,6 @@ function extractFirstImageFromHtml(html) {
 }
 
 async function ensureMainImage(shop, accessToken, productId, realProduct) {
-  // Si ya tiene imágenes, no hacer nada
   if (Array.isArray(realProduct?.images) && realProduct.images.length > 0) return;
 
   const fallbackImage = extractFirstImageFromHtml(realProduct?.body_html);
@@ -574,6 +590,7 @@ async function findProductIdsBySkus(shop, accessToken, skus) {
 /* ==========================
    FULL MODE: PRODUCT TRANSFORM
    (pricing + peso + stock + vendor/tags + compliance)
+   ✅ BLOQUEO + ✅ IMAGEN fallback
 ========================== */
 
 async function transformProductById(shop, accessToken, productId) {
@@ -610,7 +627,6 @@ async function transformProductById(shop, accessToken, productId) {
   await ensureMainImage(shop, accessToken, productId, realProduct);
 
   const realVariants = realProduct.variants || [];
-
   const materialHint = detectMaterialHint(realProduct.title, realProduct.body_html);
 
   const translatedTitleRaw = await translateText(realProduct.title);
@@ -621,7 +637,6 @@ async function transformProductById(shop, accessToken, productId) {
   translatedHtml = sanitizeHtmlForMarketplace(translatedHtml, materialHint);
 
   translatedTitle = ensureNonEmptyTitle(translatedTitle, titleBefore);
-
   const detectedCat = detectCategory(translatedTitle);
 
   await shopifyRequest(shop, {
@@ -694,9 +709,79 @@ async function transformProductById(shop, accessToken, productId) {
 }
 
 /* ==========================
+   STABLE MODE (NO toca pricing/peso/stock)
+   ✅ BLOQUEO + ✅ IMAGEN fallback + ✅ traducción/sanitize + vendor/tags/status
+========================== */
+
+async function transformProductStableById(shop, accessToken, productId) {
+  const freshProduct = await shopifyRequest(shop, {
+    method: "GET",
+    url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+    headers: { "X-Shopify-Access-Token": accessToken }
+  });
+
+  const realProduct = freshProduct.data.product;
+
+  // 🔴 BLOQUEO ESTRUCTURAL
+  if (isBlockedProduct(realProduct.title, realProduct.body_html)) {
+    await shopifyRequest(shop, {
+      method: "PUT",
+      url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+      headers: { "X-Shopify-Access-Token": accessToken },
+      data: {
+        product: {
+          id: productId,
+          status: "draft",
+          tags: "BLOCKED_BY_POLICY"
+        }
+      }
+    });
+
+    log("Producto bloqueado por política marketplace (STABLE)", { shop, productId, title: realProduct.title });
+    return;
+  }
+
+  // 🔴 IMAGEN fallback si no trae
+  await ensureMainImage(shop, accessToken, productId, realProduct);
+
+  const materialHint = detectMaterialHint(realProduct.title, realProduct.body_html);
+
+  const translatedTitleRaw = await translateText(realProduct.title);
+  let translatedHtml = await translateHtmlPreservingTags(realProduct.body_html);
+
+  const titleBefore = translatedTitleRaw;
+  let translatedTitle = sanitizeTextForMarketplace(translatedTitleRaw, materialHint);
+  translatedHtml = sanitizeHtmlForMarketplace(translatedHtml, materialHint);
+
+  translatedTitle = ensureNonEmptyTitle(translatedTitle, titleBefore);
+  const detectedCat = detectCategory(translatedTitle);
+
+  // ✅ OJO: NO toca variants / NO toca inventory / NO toca pricing / NO toca peso
+  await shopifyRequest(shop, {
+    method: "PUT",
+    url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+    headers: { "X-Shopify-Access-Token": accessToken },
+    data: {
+      product: {
+        id: productId,
+        title: translatedTitle,
+        body_html: translatedHtml,
+        vendor: "friDker Internacional",
+        product_type: detectedCat,
+        tags: detectedCat,
+        status: "active"
+      }
+    }
+  });
+
+  log("Producto transformado (STABLE)", { shop, productId });
+}
+
+/* ==========================
    CLEAN ONLY (rechazos Nelo)
    SOLO title + body_html
    NO toca pricing/peso/stock
+   ✅ BLOQUEO + ✅ IMAGEN fallback
 ========================== */
 
 async function cleanProductById(shop, accessToken, productId) {
@@ -707,6 +792,28 @@ async function cleanProductById(shop, accessToken, productId) {
   });
 
   const realProduct = freshProduct.data.product;
+
+  // 🔴 BLOQUEO ESTRUCTURAL
+  if (isBlockedProduct(realProduct.title, realProduct.body_html)) {
+    await shopifyRequest(shop, {
+      method: "PUT",
+      url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+      headers: { "X-Shopify-Access-Token": accessToken },
+      data: {
+        product: {
+          id: productId,
+          status: "draft",
+          tags: "BLOCKED_BY_POLICY"
+        }
+      }
+    });
+
+    log("Producto bloqueado por política marketplace (CLEAN)", { shop, productId, title: realProduct.title });
+    return;
+  }
+
+  // 🔴 IMAGEN fallback si no trae
+  await ensureMainImage(shop, accessToken, productId, realProduct);
 
   const materialHint = detectMaterialHint(realProduct.title, realProduct.body_html);
 
@@ -870,7 +977,6 @@ app.post("/force-full", async (req, res) => {
     });
 
     return res.json({ ok: true, queued: product_id });
-
   } catch (err) {
     console.error("force-full error:", err.response?.data || err.message);
     return res.status(500).json({ ok: false, error: err.message });
@@ -908,13 +1014,76 @@ app.post("/force-full-by-skus", async (req, res) => {
     });
 
     return res.json({ ok: true, queued: productIds.length, product_ids: productIds });
-
   } catch (err) {
     console.error("force-full-by-skus error:", err.response?.data || err.message);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
+/* ==========================
+   FORCE STABLE (NO pricing/peso/stock)
+   Body: { shop, product_id }
+========================== */
+
+app.post("/force-stable", async (req, res) => {
+  try {
+    const { shop, product_id } = req.body || {};
+
+    if (!shop || !product_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "Body requerido: { shop: 'xxx.myshopify.com', product_id: 1234567890 }"
+      });
+    }
+
+    enqueueShopJob(shop, "force-stable(STABLE)", async () => {
+      const accessToken = await getToken(shop);
+      await transformProductStableById(shop, accessToken, product_id);
+    });
+
+    return res.json({ ok: true, queued: product_id });
+  } catch (err) {
+    console.error("force-stable error:", err.response?.data || err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ==========================
+   FORCE STABLE BY SKUS (NO pricing/peso/stock)
+   Body: { shop, skus:[...] }
+========================== */
+
+app.post("/force-stable-by-skus", async (req, res) => {
+  try {
+    const { shop, skus } = req.body || {};
+
+    if (!shop || !Array.isArray(skus) || skus.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Body requerido: { shop, skus: ['PD.77','PD.714'] }"
+      });
+    }
+
+    const accessToken = await getToken(shop);
+    const productIds = await findProductIdsBySkus(shop, accessToken, skus);
+
+    if (productIds.length === 0) {
+      return res.json({ ok: true, queued: 0, note: "No se encontraron productos para esos SKUs" });
+    }
+
+    productIds.forEach(pid => {
+      enqueueShopJob(shop, "force-stable-by-skus(STABLE)", async () => {
+        const token = await getToken(shop);
+        await transformProductStableById(shop, token, pid);
+      });
+    });
+
+    return res.json({ ok: true, queued: productIds.length, product_ids: productIds });
+  } catch (err) {
+    console.error("force-stable-by-skus error:", err.response?.data || err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 /* ==========================
    HEALTH
@@ -930,7 +1099,7 @@ app.get("/health", (req, res) => {
     time: nowIso(),
     shopsInMemory: shopQueues.size,
     bannedWordsCount: getBannedWords().length,
-    version: "zeus-transformer-v1.2-full+clean+block+image"
+    version: "zeus-transformer-v1.3-full+clean+block+image+stable"
   });
 });
 
