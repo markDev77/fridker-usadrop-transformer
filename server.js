@@ -254,8 +254,17 @@ function calculatePrice(usdRaw) {
   // Blindaje marketplace
   mxn *= 1.16;
 
-  // Psicología retail
-  mxn = Math.ceil(mxn / 10) * 10 - 1;
+  /* ==========================
+     ANCLAJE PSICOLÓGICO ESPECÍFICO
+     300–600  → 699
+     700–740  → 699
+  ========================== */
+
+  if ((mxn >= 300 && mxn <= 600) || (mxn >= 700 && mxn <= 740)) {
+    mxn = 699;
+  } else {
+    mxn = Math.ceil(mxn / 10) * 10 - 1;
+  }
 
   return Math.max(99, mxn);
 }
