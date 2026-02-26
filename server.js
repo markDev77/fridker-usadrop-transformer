@@ -848,6 +848,39 @@ app.post("/reconcile-by-skus", async (req, res) => {
 });
 
 /* ==========================
+   FORCE FULL MANUAL
+   Body: { shop, product_id }
+   Ejecuta transformProductById (FULL)
+========================== */
+
+app.post("/force-full", async (req, res) => {
+  try {
+    const { shop, product_id } = req.body || {};
+
+    if (!shop || !product_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "Body requerido: { shop: 'xxx.myshopify.com', product_id: 1234567890 }"
+      });
+    }
+
+    enqueueShopJob(shop, "force-full(FULL)", async () => {
+      const accessToken = await getToken(shop);
+      await transformProductById(shop, accessToken, product_id);
+    });
+
+    return res.json({ ok: true, queued: product_id });
+
+  } catch (err) {
+    console.error("force-full error:", err.response?.data || err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
+
+
+/* ==========================
    HEALTH
 ========================== */
 
