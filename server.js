@@ -877,7 +877,43 @@ app.post("/force-full", async (req, res) => {
   }
 });
 
+/* ==========================
+   FORCE FULL BY SKUS
+   Body: { shop, skus:[...] }
+========================== */
 
+app.post("/force-full-by-skus", async (req, res) => {
+  try {
+    const { shop, skus } = req.body || {};
+
+    if (!shop || !Array.isArray(skus) || skus.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Body requerido: { shop, skus: ['PD.77','PD.714'] }"
+      });
+    }
+
+    const accessToken = await getToken(shop);
+    const productIds = await findProductIdsBySkus(shop, accessToken, skus);
+
+    if (productIds.length === 0) {
+      return res.json({ ok: true, queued: 0, note: "No se encontraron productos para esos SKUs" });
+    }
+
+    productIds.forEach(pid => {
+      enqueueShopJob(shop, "force-full-by-skus(FULL)", async () => {
+        const token = await getToken(shop);
+        await transformProductById(shop, token, pid);
+      });
+    });
+
+    return res.json({ ok: true, queued: productIds.length, product_ids: productIds });
+
+  } catch (err) {
+    console.error("force-full-by-skus error:", err.response?.data || err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 
 /* ==========================
