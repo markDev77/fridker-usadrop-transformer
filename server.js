@@ -660,7 +660,15 @@ async function transformProductById(shop, accessToken, productId) {
     headers: { "X-Shopify-Access-Token": accessToken }
   });
 
-  const realProduct = freshProduct.data.product;
+  const realProduct = freshProduct.data.product
+  const realVariants = Array.isArray(realProduct?.variants)
+    ? realProduct.variants
+    : [];
+;
+  const realVariants = Array.isArray(realProduct?.variants)
+    ? realProduct.variants
+    : [];
+
 
   // ✅ ORIGEN AUTORIZADO (SKU PD.XXX)
   const invalidSkus = realVariants
@@ -817,7 +825,15 @@ async function transformProductStableById(shop, accessToken, productId) {
     headers: { "X-Shopify-Access-Token": accessToken }
   });
 
-  const realProduct = freshProduct.data.product;
+  const realProduct = freshProduct.data.product
+  const realVariants = Array.isArray(realProduct?.variants)
+    ? realProduct.variants
+    : [];
+;
+  const realVariants = Array.isArray(realProduct?.variants)
+    ? realProduct.variants
+    : [];
+
 
   // ✅ ORIGEN AUTORIZADO (SKU PD.XXX)
   const invalidSkus = realVariants
@@ -905,7 +921,15 @@ async function cleanProductById(shop, accessToken, productId) {
     headers: { "X-Shopify-Access-Token": accessToken }
   });
 
-  const realProduct = freshProduct.data.product;
+  const realProduct = freshProduct.data.product
+  const realVariants = Array.isArray(realProduct?.variants)
+    ? realProduct.variants
+    : [];
+;
+  const realVariants = Array.isArray(realProduct?.variants)
+    ? realProduct.variants
+    : [];
+
 
   // 🔴 BLOQUEO ESTRUCTURAL
   if (isBlockedProduct(realProduct.title, realProduct.body_html)) {
