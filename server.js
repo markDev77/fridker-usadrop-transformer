@@ -80,13 +80,16 @@ function normalizeForSignature(str) {
 }
 
 function computeProductSignature(imageKey, variantCount = 0) {
-  // Signature diseñada para deduplicación estable aunque cambie el título.
-  // Base: fingerprint de imagen (normalizado, sin query) + cantidad de variantes.
   const payload = {
     img: String(imageKey || "").trim().toLowerCase(),
     vc: Number.isFinite(Number(variantCount)) ? Number(variantCount) : 0
   };
-  return sha256(JSON.stringify(payload));
+
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 function buildTagSetFromProduct(product, extraTags = []) {
@@ -895,7 +898,7 @@ async function transformProductById(shop, accessToken, productId) {
     productId,
     namespace: "custom",
     key: "zeus_image_signature",
-    value: signature,
+    value: sigHash,
     type: "single_line_text_field"
   });
 
