@@ -1,9 +1,9 @@
 require("dotenv").config();
-
 const express = require("express");
 const axios = require("axios");
 const { Pool } = require("pg");
 const cheerio = require("cheerio");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -56,6 +56,63 @@ const DEFAULT_BANNED_WORDS = [
   "cuchillo",
   "navaja"
 ];
+
+
+/* ==========================
+   ORIGEN AUTORIZADO + DEDUP
+========================== */
+
+const USADROP_SKU_REGEX = /^PD\.\d+$/i;
+const ZEUS_SIGNATURE_TAG_PREFIX = "ZEUS_SIG_";
+
+function isValidUsadropSku(sku) {
+  const s = (sku || "").trim();
+  return USADROP_SKU_REGEX.test(s);
+}
+
+function normalizeForSignature(str) {
+  return (str || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function computeProductSignature(title, firstImageSrc, variantsCount) {
+  const base = `${normalizeForSignature(title)}|${(firstImageSrc || "").trim()}|${Number(variantsCount) || 0}`;
+  return crypto.createHash("sha256").update(base).digest("hex").slice(0, 12);
+}
+
+function buildTagSetFromProduct(product, extraTags = []) {
+  const existing = (product?.tags || "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+  const all = [...existing, ...extraTags]
+    .map((t) => String(t || "").trim())
+    .filter(Boolean);
+
+  return Array.from(new Set(all));
+}
+
+async function findProductsByTag(shop, accessToken, tag) {
+  const q = `
+    query ($query: String!) {
+      products(first: 5, query: $query) {
+        edges { node { id } }
+      }
+    }`;
+
+  const data = await shopifyGraphQL(shop, accessToken, q, { query: `tag:${tag}` });
+
+  const edges = data?.products?.edges || [];
+  return edges
+    .map((e) => e?.node?.id)
+    .filter(Boolean)
+    .map((gid) => String(gid).split("/").pop());
+}
 
 function getBannedWords() {
   const extra = (process.env.ZEUS_BANNED_WORDS || "")
@@ -319,7 +376,7 @@ function calculatePrice(usdRaw) {
     mxn = 699;
   }
 
-  return Math.max(99, mxn);
+  return Math.max(599, mxn);
 }
 
 /* ==========================
@@ -554,31 +611,8 @@ function chunk(arr, size) {
   return out;
 }
 
-/* ==========================
-   SKU OFICIAL + ORIGEN AUTORIZADO
-   - SKU oficial USADROP: PD.### (case-insensitive)
-========================== */
-
-function isValidUsadropSku(sku) {
-  if (!sku) return false;
-  return /^PD\.\d+$/i.test(String(sku).trim());
-}
-
-function productHasAuthorizedUsadropSku(realProduct) {
-  const variants = realProduct?.variants || [];
-  return variants.some(v => isValidUsadropSku(v?.sku));
-}
-
 async function findProductIdsBySkus(shop, accessToken, skus) {
-  // 1) Filtra solo SKUs oficiales PD.###
-  const uniq = Array.from(
-    new Set(
-      (skus || [])
-        .map(s => String(s || "").trim())
-        .filter(s => isValidUsadropSku(s))
-    )
-  );
-
+  const uniq = Array.from(new Set((skus || []).map(s => String(s || "").trim()).filter(Boolean)));
   if (uniq.length === 0) return [];
 
   const productIds = new Set();
@@ -602,33 +636,9 @@ async function findProductIdsBySkus(shop, accessToken, skus) {
     const resp = await shopifyGraphQL(shop, accessToken, GQL, { q });
 
     const edges = resp?.data?.data?.productVariants?.edges || [];
-
-    // 2) Mapa SKU -> Set(productId) para detectar duplicados SKU (SKU repetido en productos distintos)
-    const skuMap = new Map();
-
     for (const e of edges) {
-      const sku = String(e?.node?.sku || "").trim();
       const pid = gidToNumericId(e?.node?.product?.id);
-      if (!sku || !pid) continue;
-
-      if (!skuMap.has(sku)) skuMap.set(sku, new Set());
-      skuMap.get(sku).add(pid);
-    }
-
-    // 3) Solo agrega a process los SKUs sin duplicidad
-    for (const [sku, pids] of skuMap.entries()) {
-      if (!isValidUsadropSku(sku)) continue;
-
-      if (pids.size > 1) {
-        console.error("SKU DUPLICADO DETECTADO 🚨 (NO SE PROCESA)", {
-          shop,
-          sku,
-          productIds: Array.from(pids)
-        });
-        continue; // NO procesar este SKU
-      }
-
-      productIds.add(Array.from(pids)[0]);
+      if (pid) productIds.add(pid);
     }
   }
 
@@ -639,7 +649,6 @@ async function findProductIdsBySkus(shop, accessToken, skus) {
    FULL MODE: PRODUCT TRANSFORM
    (pricing + peso + stock + vendor/tags + compliance)
    ✅ BLOQUEO + ✅ IMAGEN fallback
-   ✅ ORIGEN AUTORIZADO por SKU PD.###
 ========================== */
 
 async function transformProductById(shop, accessToken, productId) {
@@ -653,14 +662,19 @@ async function transformProductById(shop, accessToken, productId) {
 
   const realProduct = freshProduct.data.product;
 
-  // ✅ ORIGEN AUTORIZADO: si no trae al menos 1 SKU PD.###, NO se toca
-  if (!productHasAuthorizedUsadropSku(realProduct)) {
-    log("SKIP (ORIGEN NO AUTORIZADO): producto sin SKU PD.###", {
-      shop,
-      productId,
-      vendor: realProduct?.vendor,
-      title: realProduct?.title
+  // ✅ ORIGEN AUTORIZADO (SKU PD.XXX)
+  const invalidSkus = realVariants
+    .map((v) => (v?.sku || "").trim())
+    .filter((sku) => sku && !isValidUsadropSku(sku));
+
+  if (invalidSkus.length) {
+    await shopifyRequest(shop, {
+      method: "PUT",
+      url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+      headers: { "X-Shopify-Access-Token": accessToken },
+      data: { product: { id: productId, status: "draft", tags: buildTagSetFromProduct(realProduct, ["ORIGIN_NOT_AUTHORIZED"]).join(", ") } }
     });
+    log("Producto bloqueado por ORIGEN AUTORIZADO (SKU inválido)", { shop, productId, invalidSkus: invalidSkus.slice(0, 10) });
     return;
   }
 
@@ -674,7 +688,7 @@ async function transformProductById(shop, accessToken, productId) {
         product: {
           id: productId,
           status: "draft",
-          tags: "BLOCKED_BY_POLICY"
+          tags: buildTagSetFromProduct(realProduct, ["BLOCKED_BY_POLICY"]).join(", ")
         }
       }
     });
@@ -686,7 +700,29 @@ async function transformProductById(shop, accessToken, productId) {
   // 🔴 ASEGURAR IMAGEN PRINCIPAL (SI NO TRAE)
   await ensureMainImage(shop, accessToken, productId, realProduct);
 
-  const realVariants = realProduct.variants || [];
+  // ✅ DEDUP: firma estructural (título original + 1a imagen + #variantes)
+  const firstImageSrc = (realProduct.images && realProduct.images[0] && realProduct.images[0].src)
+    ? realProduct.images[0].src
+    : extractFirstImageFromHtml(realProduct.body_html || "");
+
+  const sigHash = computeProductSignature(realProduct.title, firstImageSrc, realVariants.length);
+  const sigTag = `${ZEUS_SIGNATURE_TAG_PREFIX}${sigHash}`;
+
+  const dupIds = await findProductsByTag(shop, accessToken, sigTag);
+  const hasDup = dupIds.some((id) => String(id) !== String(productId));
+
+  if (hasDup) {
+    const tags = buildTagSetFromProduct(realProduct, ["DUPLICATE_SIGNATURE", sigTag]).join(", ");
+    await shopifyRequest(shop, {
+      method: "PUT",
+      url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+      headers: { "X-Shopify-Access-Token": accessToken },
+      data: { product: { id: productId, status: "draft", tags } }
+    });
+    log("Producto bloqueado por duplicidad estructural (signature hash)", { shop, productId, sigTag, dupIds });
+    return;
+  }
+
   const materialHint = detectMaterialHint(realProduct.title, realProduct.body_html);
 
   const translatedTitleRaw = await translateText(realProduct.title);
@@ -698,6 +734,7 @@ async function transformProductById(shop, accessToken, productId) {
 
   translatedTitle = ensureNonEmptyTitle(translatedTitle, titleBefore);
   const detectedCat = detectCategory(translatedTitle);
+  const tags = buildTagSetFromProduct(realProduct, [detectedCat, sigTag]).join(", ");
 
   await shopifyRequest(shop, {
     method: "PUT",
@@ -710,7 +747,7 @@ async function transformProductById(shop, accessToken, productId) {
         body_html: translatedHtml,
         vendor: "friDker Internacional",
         product_type: detectedCat,
-        tags: detectedCat,
+        tags,
         status: "active"
       }
     }
@@ -771,7 +808,6 @@ async function transformProductById(shop, accessToken, productId) {
 /* ==========================
    STABLE MODE (NO toca pricing/peso/stock)
    ✅ BLOQUEO + ✅ IMAGEN fallback + ✅ traducción/sanitize + vendor/tags/status
-   ✅ ORIGEN AUTORIZADO por SKU PD.###
 ========================== */
 
 async function transformProductStableById(shop, accessToken, productId) {
@@ -783,14 +819,19 @@ async function transformProductStableById(shop, accessToken, productId) {
 
   const realProduct = freshProduct.data.product;
 
-  // ✅ ORIGEN AUTORIZADO
-  if (!productHasAuthorizedUsadropSku(realProduct)) {
-    log("SKIP (ORIGEN NO AUTORIZADO): producto sin SKU PD.### (STABLE)", {
-      shop,
-      productId,
-      vendor: realProduct?.vendor,
-      title: realProduct?.title
+  // ✅ ORIGEN AUTORIZADO (SKU PD.XXX)
+  const invalidSkus = realVariants
+    .map((v) => (v?.sku || "").trim())
+    .filter((sku) => sku && !isValidUsadropSku(sku));
+
+  if (invalidSkus.length) {
+    await shopifyRequest(shop, {
+      method: "PUT",
+      url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}.json`,
+      headers: { "X-Shopify-Access-Token": accessToken },
+      data: { product: { id: productId, status: "draft", tags: buildTagSetFromProduct(realProduct, ["ORIGIN_NOT_AUTHORIZED"]).join(", ") } }
     });
+    log("Producto bloqueado por ORIGEN AUTORIZADO (SKU inválido)", { shop, productId, invalidSkus: invalidSkus.slice(0, 10) });
     return;
   }
 
@@ -804,7 +845,7 @@ async function transformProductStableById(shop, accessToken, productId) {
         product: {
           id: productId,
           status: "draft",
-          tags: "BLOCKED_BY_POLICY"
+          tags: buildTagSetFromProduct(realProduct, ["BLOCKED_BY_POLICY"]).join(", ")
         }
       }
     });
@@ -827,6 +868,7 @@ async function transformProductStableById(shop, accessToken, productId) {
 
   translatedTitle = ensureNonEmptyTitle(translatedTitle, titleBefore);
   const detectedCat = detectCategory(translatedTitle);
+  const tags = buildTagSetFromProduct(realProduct, [detectedCat]).join(", ");
 
   // ✅ OJO: NO toca variants / NO toca inventory / NO toca pricing / NO toca peso
   await shopifyRequest(shop, {
@@ -840,7 +882,7 @@ async function transformProductStableById(shop, accessToken, productId) {
         body_html: translatedHtml,
         vendor: "friDker Internacional",
         product_type: detectedCat,
-        tags: detectedCat,
+        tags,
         status: "active"
       }
     }
@@ -854,7 +896,6 @@ async function transformProductStableById(shop, accessToken, productId) {
    SOLO title + body_html
    NO toca pricing/peso/stock
    ✅ BLOQUEO + ✅ IMAGEN fallback
-   ✅ ORIGEN AUTORIZADO por SKU PD.###
 ========================== */
 
 async function cleanProductById(shop, accessToken, productId) {
@@ -866,17 +907,6 @@ async function cleanProductById(shop, accessToken, productId) {
 
   const realProduct = freshProduct.data.product;
 
-  // ✅ ORIGEN AUTORIZADO
-  if (!productHasAuthorizedUsadropSku(realProduct)) {
-    log("SKIP (ORIGEN NO AUTORIZADO): producto sin SKU PD.### (CLEAN)", {
-      shop,
-      productId,
-      vendor: realProduct?.vendor,
-      title: realProduct?.title
-    });
-    return;
-  }
-
   // 🔴 BLOQUEO ESTRUCTURAL
   if (isBlockedProduct(realProduct.title, realProduct.body_html)) {
     await shopifyRequest(shop, {
@@ -887,7 +917,7 @@ async function cleanProductById(shop, accessToken, productId) {
         product: {
           id: productId,
           status: "draft",
-          tags: "BLOCKED_BY_POLICY"
+          tags: buildTagSetFromProduct(realProduct, ["BLOCKED_BY_POLICY"]).join(", ")
         }
       }
     });
@@ -1183,7 +1213,7 @@ app.get("/health", (req, res) => {
     time: nowIso(),
     shopsInMemory: shopQueues.size,
     bannedWordsCount: getBannedWords().length,
-    version: "zeus-transformer-v1.3.1-full+clean+block+image+stable+sku-guard+origin-guard"
+    version: "zeus-transformer-v1.3-full+clean+block+image+stable"
   });
 });
 
