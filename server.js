@@ -79,8 +79,8 @@ function normalizeForSignature(str) {
     .trim();
 }
 
-function computeProductSignature(title, firstImageSrc, variantsCount) {
-  const base = `${normalizeForSignature(title)}|${(firstImageSrc || "").trim()}|${Number(variantsCount) || 0}`;
+function computeProductSignature(title, imageKey) {
+  const base = `${normalizeForSignature(title)}|${(imageKey || "").trim()}`;
   return crypto.createHash("sha256").update(base).digest("hex").slice(0, 12);
 }
 
@@ -182,6 +182,77 @@ function extractFirstImageFromHtml(html) {
   if (!s) return null;
   if (s.startsWith("data:")) return null; // evita base64
   return s;
+}
+function normalizeImageFingerprint(src) {
+  if (!src || typeof src !== "string") return "";
+  let clean = src.trim();
+  // Drop surrounding quotes if any
+  clean = clean.replace(/^['"]|['"]$/g, "");
+  // Remove query/hash
+  clean = clean.split("#")[0].split("?")[0];
+
+  // If it's a full URL, keep only the path; otherwise keep as-is
+  try {
+    if (/^https?:\/\//i.test(clean)) {
+      const u = new URL(clean);
+      clean = (u.pathname || "").toLowerCase();
+    } else {
+      clean = clean.toLowerCase();
+    }
+  } catch (_) {
+    clean = clean.toLowerCase();
+  }
+
+  // Take last path segment if available; fallback to full (relative) path
+  const parts = clean.split("/").filter(Boolean);
+  const last = parts.length ? parts[parts.length - 1] : clean;
+  return last || "";
+}
+
+function extractImageFingerprintsFromHtml(html, limit = 3) {
+  if (!html || typeof html !== "string") return [];
+  const out = [];
+  const imgTagRegex = /<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  let m;
+  while ((m = imgTagRegex.exec(html)) !== null) {
+    const fp = normalizeImageFingerprint(m[1]);
+    if (fp) out.push(fp);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function buildImageFingerprintKey(realProduct, limit = 3) {
+  const fps = [];
+
+  // 1) From Shopify product images
+  const imgs = Array.isArray(realProduct?.images) ? realProduct.images : [];
+  for (const img of imgs) {
+    const src = img?.src || img?.url || img?.originalSrc;
+    const fp = normalizeImageFingerprint(src);
+    if (fp) fps.push(fp);
+    if (fps.length >= limit) break;
+  }
+
+  // 2) From HTML (often includes supplier images)
+  const htmlFps = extractImageFingerprintsFromHtml(realProduct?.body_html || "", limit);
+  for (const fp of htmlFps) {
+    if (fp) fps.push(fp);
+    if (fps.length >= limit * 2) break; // allow a bit more then de-dupe
+  }
+
+  // De-dupe preserving order
+  const seen = new Set();
+  const uniq = [];
+  for (const fp of fps) {
+    if (!fp) continue;
+    if (seen.has(fp)) continue;
+    seen.add(fp);
+    uniq.push(fp);
+    if (uniq.length >= limit) break;
+  }
+
+  return uniq.join("|");
 }
 
 async function ensureMainImage(shop, accessToken, productId, realProduct) {
@@ -705,11 +776,8 @@ async function transformProductById(shop, accessToken, productId) {
   await ensureMainImage(shop, accessToken, productId, realProduct);
 
   // ✅ DEDUP: firma estructural (título original + 1a imagen + #variantes)
-  const firstImageSrc = (realProduct.images && realProduct.images[0] && realProduct.images[0].src)
-    ? realProduct.images[0].src
-    : extractFirstImageFromHtml(realProduct.body_html || "");
-
-  const sigHash = computeProductSignature(realProduct.title, firstImageSrc, realVariants.length);
+  const imageKey = buildImageFingerprintKey(realProduct, 3);
+  const sigHash = computeProductSignature(realProduct.title, imageKey);
   const sigTag = `${ZEUS_SIGNATURE_TAG_PREFIX}${sigHash}`;
 
   const dupIds = await findProductsByTag(shop, accessToken, sigTag);
@@ -1221,7 +1289,7 @@ app.get("/health", (req, res) => {
     time: nowIso(),
     shopsInMemory: shopQueues.size,
     bannedWordsCount: getBannedWords().length,
-    version: "zeus-transformer-v1.3-full+clean+block+image+stable"
+    version: "zeus-transformer-v1.5.1-image-htmlfp-dedup"
   });
 });
 
