@@ -64,6 +64,8 @@ const DEFAULT_BANNED_WORDS = [
 
 const USADROP_SKU_REGEX = /^PD\.\d+$/i;
 const ZEUS_SIGNATURE_TAG_PREFIX = "ZEUS_SIG_";
+const ZEUS_METAFIELD_NAMESPACE = "custom";
+const ZEUS_METAFIELD_KEY_IMAGE_SIGNATURE = "zeus_image_signature";
 
 function isValidUsadropSku(sku) {
   const s = (sku || "").trim();
@@ -223,22 +225,24 @@ function extractImageFingerprintsFromHtml(html, limit = 3) {
 }
 
 function buildImageFingerprintKey(realProduct, limit = 3) {
+  // Priority: HTML supplier images first (stable across re-imports),
+  // fallback: Shopify product images (can change CDN URLs per import).
   const fps = [];
 
-  // 1) From Shopify product images
+  // 1) From HTML (often includes supplier images)
+  const htmlFps = extractImageFingerprintsFromHtml(realProduct?.body_html || "", limit * 3);
+  for (const fp of htmlFps) {
+    if (fp) fps.push(fp);
+    if (fps.length >= limit * 2) break; // gather extra then de-dupe
+  }
+
+  // 2) From Shopify product images
   const imgs = Array.isArray(realProduct?.images) ? realProduct.images : [];
   for (const img of imgs) {
     const src = img?.src || img?.url || img?.originalSrc;
     const fp = normalizeImageFingerprint(src);
     if (fp) fps.push(fp);
-    if (fps.length >= limit) break;
-  }
-
-  // 2) From HTML (often includes supplier images)
-  const htmlFps = extractImageFingerprintsFromHtml(realProduct?.body_html || "", limit);
-  for (const fp of htmlFps) {
-    if (fp) fps.push(fp);
-    if (fps.length >= limit * 2) break; // allow a bit more then de-dupe
+    if (fps.length >= limit * 4) break; // gather extra then de-dupe
   }
 
   // De-dupe preserving order
@@ -253,52 +257,6 @@ function buildImageFingerprintKey(realProduct, limit = 3) {
   }
 
   return uniq.join("|");
-}
-
-async function ensureMainImage(shop, accessToken, productId, realProduct) {
-  if (Array.isArray(realProduct?.images) && realProduct.images.length > 0) return;
-
-  const fallbackImage = extractFirstImageFromHtml(realProduct?.body_html);
-  if (!fallbackImage) {
-    log("No fallback image found", { shop, productId });
-    return;
-  }
-
-  await shopifyRequest(shop, {
-    method: "POST",
-    url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}/images.json`,
-    headers: { "X-Shopify-Access-Token": accessToken },
-    data: { image: { src: fallbackImage } }
-  });
-
-  log("Fallback image applied", { shop, productId, fallbackImage });
-}
-
-/* ==========================
-   POSTGRES
-========================== */
-
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS shop_tokens (
-      shop TEXT PRIMARY KEY,
-      access_token TEXT NOT NULL
-    );
-  `);
-  console.log("shop_tokens table ready");
-}
-
-/* ==========================
-   LOGS
-========================== */
-
-function nowIso() {
-  return new Date().toISOString();
 }
 
 function log(tag, obj) {
@@ -407,6 +365,55 @@ async function shopifyRequest(shop, config, attempt = 0) {
     return shopifyRequest(shop, config, attempt + 1);
   }
 }
+
+
+
+async function upsertProductMetafield(shop, accessToken, productId, namespace, key, type, value) {
+  // Tries to update existing metafield; if none exists, creates it.
+  const base = `https://${shop}/admin/api/${PRODUCT_API_VERSION}`;
+
+  // Shopify REST supports filtering by namespace & key on metafields endpoints.
+  const getUrl = `${base}/products/${productId}/metafields.json?namespace=${encodeURIComponent(namespace)}&key=${encodeURIComponent(key)}`;
+  const existingRes = await shopifyRequest({
+    method: "GET",
+    url: getUrl,
+    headers: { "X-Shopify-Access-Token": accessToken },
+  });
+
+  const existing = existingRes?.metafields?.[0];
+
+  if (existing?.id) {
+    const putUrl = `${base}/metafields/${existing.id}.json`;
+    return await shopifyRequest({
+      method: "PUT",
+      url: putUrl,
+      headers: { "X-Shopify-Access-Token": accessToken },
+      data: {
+        metafield: {
+          id: existing.id,
+          value,
+          type,
+        },
+      },
+    });
+  }
+
+  const postUrl = `${base}/products/${productId}/metafields.json`;
+  return await shopifyRequest({
+    method: "POST",
+    url: postUrl,
+    headers: { "X-Shopify-Access-Token": accessToken },
+    data: {
+      metafield: {
+        namespace,
+        key,
+        type,
+        value,
+      },
+    },
+  });
+}
+
 
 /* ==========================
    TOKENS
@@ -825,7 +832,24 @@ async function transformProductById(shop, accessToken, productId) {
     }
   });
 
-  // Variantes: pricing + peso
+  // 
+  // Persist ZEUS image signature (for audit/filtering inside Shopify)
+  try {
+    const metaValue = `SIG:${signature} FPKEY:${imageKey}`;
+    await upsertProductMetafield(
+      shop,
+      accessToken,
+      productId,
+      ZEUS_METAFIELD_NAMESPACE,
+      ZEUS_METAFIELD_KEY_IMAGE_SIGNATURE,
+      "single_line_text_field",
+      metaValue
+    );
+  } catch (e) {
+    console.warn("[metafield] failed to upsert zeus_image_signature", e?.message || e);
+  }
+
+Variantes: pricing + peso
   for (const variant of realVariants) {
     const usd = parseFloat(variant.price);
     const mxnPrice = calculatePrice(Number.isFinite(usd) ? usd : 0);
