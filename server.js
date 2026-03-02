@@ -64,8 +64,6 @@ const DEFAULT_BANNED_WORDS = [
 
 const USADROP_SKU_REGEX = /^PD\.\d+$/i;
 const ZEUS_SIGNATURE_TAG_PREFIX = "ZEUS_SIG_";
-const ZEUS_METAFIELD_NAMESPACE = "custom";
-const ZEUS_METAFIELD_KEY_IMAGE_SIGNATURE = "zeus_image_signature";
 
 function isValidUsadropSku(sku) {
   const s = (sku || "").trim();
@@ -81,9 +79,14 @@ function normalizeForSignature(str) {
     .trim();
 }
 
-function computeProductSignature(title, imageKey) {
-  const base = `${normalizeForSignature(title)}|${(imageKey || "").trim()}`;
-  return crypto.createHash("sha256").update(base).digest("hex").slice(0, 12);
+function computeProductSignature(imageKey, variantCount = 0) {
+  // Signature diseñada para deduplicación estable aunque cambie el título.
+  // Base: fingerprint de imagen (normalizado, sin query) + cantidad de variantes.
+  const payload = {
+    img: String(imageKey || "").trim().toLowerCase(),
+    vc: Number.isFinite(Number(variantCount)) ? Number(variantCount) : 0
+  };
+  return sha256(JSON.stringify(payload));
 }
 
 function buildTagSetFromProduct(product, extraTags = []) {
@@ -225,24 +228,22 @@ function extractImageFingerprintsFromHtml(html, limit = 3) {
 }
 
 function buildImageFingerprintKey(realProduct, limit = 3) {
-  // Priority: HTML supplier images first (stable across re-imports),
-  // fallback: Shopify product images (can change CDN URLs per import).
   const fps = [];
 
-  // 1) From HTML (often includes supplier images)
-  const htmlFps = extractImageFingerprintsFromHtml(realProduct?.body_html || "", limit * 3);
-  for (const fp of htmlFps) {
-    if (fp) fps.push(fp);
-    if (fps.length >= limit * 2) break; // gather extra then de-dupe
-  }
-
-  // 2) From Shopify product images
+  // 1) From Shopify product images
   const imgs = Array.isArray(realProduct?.images) ? realProduct.images : [];
   for (const img of imgs) {
     const src = img?.src || img?.url || img?.originalSrc;
     const fp = normalizeImageFingerprint(src);
     if (fp) fps.push(fp);
-    if (fps.length >= limit * 4) break; // gather extra then de-dupe
+    if (fps.length >= limit) break;
+  }
+
+  // 2) From HTML (often includes supplier images)
+  const htmlFps = extractImageFingerprintsFromHtml(realProduct?.body_html || "", limit);
+  for (const fp of htmlFps) {
+    if (fp) fps.push(fp);
+    if (fps.length >= limit * 2) break; // allow a bit more then de-dupe
   }
 
   // De-dupe preserving order
@@ -257,6 +258,52 @@ function buildImageFingerprintKey(realProduct, limit = 3) {
   }
 
   return uniq.join("|");
+}
+
+async function ensureMainImage(shop, accessToken, productId, realProduct) {
+  if (Array.isArray(realProduct?.images) && realProduct.images.length > 0) return;
+
+  const fallbackImage = extractFirstImageFromHtml(realProduct?.body_html);
+  if (!fallbackImage) {
+    log("No fallback image found", { shop, productId });
+    return;
+  }
+
+  await shopifyRequest(shop, {
+    method: "POST",
+    url: `https://${shop}/admin/api/${PRODUCT_API_VERSION}/products/${productId}/images.json`,
+    headers: { "X-Shopify-Access-Token": accessToken },
+    data: { image: { src: fallbackImage } }
+  });
+
+  log("Fallback image applied", { shop, productId, fallbackImage });
+}
+
+/* ==========================
+   POSTGRES
+========================== */
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_tokens (
+      shop TEXT PRIMARY KEY,
+      access_token TEXT NOT NULL
+    );
+  `);
+  console.log("shop_tokens table ready");
+}
+
+/* ==========================
+   LOGS
+========================== */
+
+function nowIso() {
+  return new Date().toISOString();
 }
 
 function log(tag, obj) {
@@ -367,53 +414,62 @@ async function shopifyRequest(shop, config, attempt = 0) {
 }
 
 
+async function upsertProductMetafield({ shop, accessToken, productId, namespace, key, value, type = "single_line_text_field" }) {
+  if (!shop || !accessToken || !productId || !namespace || !key) return null;
 
-async function upsertProductMetafield(shop, accessToken, productId, namespace, key, type, value) {
-  // Tries to update existing metafield; if none exists, creates it.
   const base = `https://${shop}/admin/api/${PRODUCT_API_VERSION}`;
 
-  // Shopify REST supports filtering by namespace & key on metafields endpoints.
-  const getUrl = `${base}/products/${productId}/metafields.json?namespace=${encodeURIComponent(namespace)}&key=${encodeURIComponent(key)}`;
-  const existingRes = await shopifyRequest({
-    method: "GET",
-    url: getUrl,
-    headers: { "X-Shopify-Access-Token": accessToken },
-  });
+  try {
+    // Buscar si ya existe el metafield (namespace+key) en el producto
+    const listUrl = `${base}/products/${productId}/metafields.json?namespace=${encodeURIComponent(namespace)}&key=${encodeURIComponent(key)}`;
+    const list = await shopifyRequest(shop, {
+      method: "GET",
+      url: listUrl,
+      headers: { "X-Shopify-Access-Token": accessToken }
+    });
 
-  const existing = existingRes?.metafields?.[0];
+    const items = list?.metafields || [];
+    const found = items[0];
 
-  if (existing?.id) {
-    const putUrl = `${base}/metafields/${existing.id}.json`;
-    return await shopifyRequest({
-      method: "PUT",
-      url: putUrl,
+    // Si existe, actualizar
+    if (found?.id) {
+      const putUrl = `${base}/metafields/${found.id}.json`;
+      const res = await shopifyRequest(shop, {
+        method: "PUT",
+        url: putUrl,
+        headers: { "X-Shopify-Access-Token": accessToken },
+        data: {
+          metafield: {
+            id: found.id,
+            value: String(value ?? ""),
+            type
+          }
+        }
+      });
+      return res?.metafield || null;
+    }
+
+    // Si no existe, crear
+    const postUrl = `${base}/products/${productId}/metafields.json`;
+    const res = await shopifyRequest(shop, {
+      method: "POST",
+      url: postUrl,
       headers: { "X-Shopify-Access-Token": accessToken },
       data: {
         metafield: {
-          id: existing.id,
-          value,
-          type,
-        },
-      },
+          namespace,
+          key,
+          value: String(value ?? ""),
+          type
+        }
+      }
     });
+    return res?.metafield || null;
+  } catch (e) {
+    console.log("[metafield] upsert failed:", e?.message || e);
+    return null;
   }
-
-  const postUrl = `${base}/products/${productId}/metafields.json`;
-  return await shopifyRequest({
-    method: "POST",
-    url: postUrl,
-    headers: { "X-Shopify-Access-Token": accessToken },
-    data: {
-      metafield: {
-        namespace,
-        key,
-        type,
-        value,
-      },
-    },
-  });
 }
-
 
 /* ==========================
    TOKENS
@@ -784,7 +840,7 @@ async function transformProductById(shop, accessToken, productId) {
 
   // ✅ DEDUP: firma estructural (título original + 1a imagen + #variantes)
   const imageKey = buildImageFingerprintKey(realProduct, 3);
-  const sigHash = computeProductSignature(realProduct.title, imageKey);
+  const sigHash = computeProductSignature(imageKey, realVariants.length);
   const sigTag = `${ZEUS_SIGNATURE_TAG_PREFIX}${sigHash}`;
 
   const dupIds = await findProductsByTag(shop, accessToken, sigTag);
@@ -832,24 +888,18 @@ async function transformProductById(shop, accessToken, productId) {
     }
   });
 
-  // 
-  // Persist ZEUS image signature (for audit/filtering inside Shopify)
-  try {
-    const metaValue = `SIG:${signature} FPKEY:${imageKey}`;
-    await upsertProductMetafield(
-      shop,
-      accessToken,
-      productId,
-      ZEUS_METAFIELD_NAMESPACE,
-      ZEUS_METAFIELD_KEY_IMAGE_SIGNATURE,
-      "single_line_text_field",
-      metaValue
-    );
-  } catch (e) {
-    console.warn("[metafield] failed to upsert zeus_image_signature", e?.message || e);
-  }
+  // Guardar firma estable para deduplicación (metafield)
+  await upsertProductMetafield({
+    shop,
+    accessToken,
+    productId,
+    namespace: "custom",
+    key: "zeus_image_signature",
+    value: signature,
+    type: "single_line_text_field"
+  });
 
-Variantes: pricing + peso
+  // Variantes: pricing + peso
   for (const variant of realVariants) {
     const usd = parseFloat(variant.price);
     const mxnPrice = calculatePrice(Number.isFinite(usd) ? usd : 0);
