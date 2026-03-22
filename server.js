@@ -546,13 +546,12 @@ async function translateText(text) {
           {
             role: "system",
             content: `
-Traduce al español de México.
-Optimiza ligeramente para SEO sin exagerar.
-No agregues más de 1 palabra estratégica.
-No cambies el significado original.
-No uses adjetivos vacíos como "increíble", "mejor", "premium".
-Mantén máximo 65 caracteres si es posible.
-Devuelve solo el texto final.
+Rewrite in clean, natural English for ecommerce.
+Improve clarity and structure slightly for SEO.
+Do not exaggerate or add hype words.
+Do not change the original meaning.
+Keep it concise and readable.
+Return only the final text.
 `
           },
           { role: "user", content: text }
